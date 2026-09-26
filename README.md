@@ -56,3 +56,18 @@ A session goes like this:
 - [learn-anything](https://github.com/ChenChenyaqi/learn-anything): knowledge maps, choosing your own depth, per-concept notes, and reusable quiz decks.
 - Hermes Agent / Honcho: an observer that models the user.
 - Meridian and The Professor: an earlier attempt at a learning-first coding tutor. The assistance ladder and verification ideas come from there. The rigidity was left behind.
+
+## Run the Phase-0 chat spike
+
+Requires Node.js 22.19+ and a configured [pi](https://github.com/earendil-works/pi-coding-agent) model/credential (for example, sign in with `pi` first). The pi SDK is pinned to `0.87.1`.
+
+```bash
+npm ci
+npm run dev
+```
+
+Open `http://localhost:5173`. Vite proxies `/ws` to the local backend on `127.0.0.1:8788`. Set `LEARN_PORT` to change the backend port, and `LEARN_CWD` to choose the agent's working directory. Credentials and model settings come from pi's agent directory (`PI_CODING_AGENT_DIR`, or pi's normal default). If npm 10 encounters its peer-dependency resolution error, use `npm ci --legacy-peer-deps`.
+
+For a production build, run `npm run build` and `npm start`, then open `http://127.0.0.1:8788`. Run `npm run typecheck` and `npm test` for the spike's checks.
+
+This is deliberately a **thin adaptation of Dispatch-WebUI's pi SDK/WebSocket pattern**, not the full Dispatch-WebUI fork described for later phases in [`docs/plan.md`](docs/plan.md). The first prompt streams a reply and fires a versioned `learn:demo` event through `pi.events` into a visible browser card. Sessions are currently in memory (lost on refresh); there is no topic graph, teaching workflow, model picker, terminal, or setup wizard yet. The event is a wiring demonstration, not learning data. See the upstream [Dispatch-WebUI](https://github.com/MichaelT025/DispatchWeb) MIT license retained in [`LICENSE`](LICENSE).
