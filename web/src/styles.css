@@ -1,0 +1,185 @@
+:root {
+  color-scheme: light dark;
+  --bg: #faf8f2;
+  --fg: #23201a;
+  --card: #fffdf8;
+  --border: #ddd4c2;
+  --accent: #5b6abf;
+  --user-bg: #e8ecff;
+  --error: #b3261e;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #191712;
+    --fg: #ece7db;
+    --card: #221f19;
+    --border: #453f33;
+    --accent: #9aa5ff;
+    --user-bg: #2a3050;
+    --error: #ff8a80;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  max-width: 44rem;
+  min-height: 100dvh;
+  margin: 0 auto;
+  padding: 1rem;
+  gap: 0.75rem;
+}
+
+.app-header h1 {
+  margin: 0;
+  font-size: 1.25rem;
+}
+
+.status-row {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+  font-size: 0.875rem;
+}
+
+.status {
+  font-weight: 600;
+}
+
+.status-open {
+  color: green;
+}
+
+.status-connecting {
+  color: darkorange;
+}
+
+.status-closed {
+  color: var(--error);
+}
+
+.model {
+  opacity: 0.75;
+}
+
+.event-card {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 0.5rem;
+  background: var(--card);
+  padding: 0.5rem 0.75rem;
+}
+
+.event-card p {
+  margin: 0.25rem 0 0;
+}
+
+.event-badge {
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+}
+
+.transcript {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  flex: 1;
+}
+
+.empty {
+  opacity: 0.6;
+}
+
+.message {
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--card);
+  padding: 0.5rem 0.75rem;
+}
+
+.message-user {
+  background: var(--user-bg);
+  align-self: flex-end;
+  max-width: 85%;
+}
+
+.message-assistant {
+  align-self: flex-start;
+  max-width: 95%;
+}
+
+.message p {
+  margin: 0.25rem 0 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.role {
+  font-size: 0.75rem;
+  font-weight: 700;
+  opacity: 0.7;
+}
+
+.error {
+  color: var(--error);
+  border: 1px solid var(--error);
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.75rem;
+}
+
+.composer {
+  display: flex;
+  gap: 0.5rem;
+  position: sticky;
+  bottom: 0;
+  padding: 0.5rem 0;
+  background: var(--bg);
+}
+
+.composer input {
+  flex: 1;
+  font: inherit;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--card);
+  color: var(--fg);
+}
+
+.composer button {
+  font: inherit;
+  padding: 0.5rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--accent);
+  color: white;
+  cursor: pointer;
+}
+
+.composer button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+}

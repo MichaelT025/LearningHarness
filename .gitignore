@@ -1,1 +1,7 @@
 docs/references
+node_modules/
+dist/
+web/dist/
+coverage/
+*.log
+.env
