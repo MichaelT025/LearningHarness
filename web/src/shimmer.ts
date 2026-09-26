@@ -1,6 +1,6 @@
 import type { CSSProperties } from "react";
 
-/** Period of the `toolcall-shimmer` keyframes (messages.css / workers.css). */
+/** Period of the `toolcall-shimmer` keyframes (messages.css). */
 export const SHIMMER_PERIOD_MS = 1800;
 
 /**

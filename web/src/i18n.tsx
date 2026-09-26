@@ -6,7 +6,7 @@ import { createContext, useContext, useMemo, type ReactNode } from "react";
 
 export const en = {
 	/* common */
-	docTitle: "Dispatch Web",
+	docTitle: "LearningHarness",
 	cancel: "Cancel",
 	ok: "OK",
 	save: "Save",
@@ -46,7 +46,7 @@ export const en = {
 	astraFiles: "Files",
 	astraReview: "Review",
 	astraWorkspaceHint: "Pick a panel to open",
-	astraEmptyHint: "Type a message to start, or press / for commands",
+	astraEmptyHint: "What would you like to learn today?",
 	fpBack: "Back to files",
 	chat: "Chat",
 	terminal: "Terminal",

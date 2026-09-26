@@ -2,9 +2,9 @@
 
 **Learn at your pace, not the pace of the slowest student.**
 
-LearningHarness is a personal, local learning environment. You tell it what you want to learn and what you already know. It maps the subject, skips what you've already got, and teaches the rest one step at a time. You decide how deep to go.
+LearningHarness is a personal, local learning environment in development. Today it provides a pi-powered chat shell; the teaching workflow described below is the goal, **not yet implemented**. Eventually you'll tell it what you want to learn and what you already know. It will map the subject, skip what you've already got, and teach the rest one step at a time. You'll decide how deep to go.
 
-Think NotebookLM, but it has a model of *you*: what you know, where you've struggled, and how you like things explained. It keeps that model across every subject you learn.
+The longer-term idea is NotebookLM with a model of *you*: what you know, where you've struggled, and how you like things explained. Building that model across subjects comes later.
 
 ## Why
 
@@ -17,9 +17,9 @@ LearningHarness flips that:
 - **New ideas are anchored to old ones.** If you know C++, Rust ownership is taught as what's different from RAII, not from scratch.
 - **Few roadblocks.** Checks steer where to slow down. They never stop you from getting help.
 
-## What it looks like
+## Planned learning experience
 
-A topic is a notebook:
+A topic would be a notebook:
 
 - **A knowledge graph.** The subject as concepts and how they connect: what each one requires, what it's part of, what it resembles. You see it as a **map** (the whole subject), a **roadmap** (your route to your goal, with what you already know skipped) and a **neighborhood** (where you are right now).
 - **Notes.** Each concept gets a self-contained note, written as you learn. When you come back weeks later, you reread notes instead of scrolling through chat.
@@ -57,17 +57,19 @@ A session goes like this:
 - Hermes Agent / Honcho: an observer that models the user.
 - Meridian and The Professor: an earlier attempt at a learning-first coding tutor. The assistance ladder and verification ideas come from there. The rigidity was left behind.
 
-## Run the Phase-0 chat spike
+## Run the chat fork
 
-Requires Node.js 22.19+ and a configured [pi](https://github.com/earendil-works/pi-coding-agent) model/credential (for example, sign in with `pi` first). The pi SDK is pinned to `0.87.1`.
+Requires Node.js 22.19+ and a configured [pi](https://github.com/earendil-works/pi-coding-agent) model/credential (or use the in-app model setup). The pi SDK is pinned to `0.87.1`.
 
 ```bash
 npm ci
 npm run dev
 ```
 
-Open `http://localhost:5173`. Vite proxies `/ws` to the local backend on `127.0.0.1:8788`. Set `LEARN_PORT` to change the backend port, and `LEARN_CWD` to choose the agent's working directory. Credentials and model settings come from pi's agent directory (`PI_CODING_AGENT_DIR`, or pi's normal default). If npm 10 encounters its peer-dependency resolution error, use `npm ci --legacy-peer-deps`.
+Open `http://localhost:5173`. The local backend listens on `127.0.0.1:8788` and Vite proxies `/ws` to it. Set `LEARN_PORT` to change the backend port (Vite follows it), `LEARN_CWD` to choose the initial working directory, or `LEARN_DATA_DIR` for LearningHarness state (default `~/.learning-harness`, with pi session files under `sessions/`). The backend binds loopback only. The launcher ignores any unrelated Dispatch instance's `PI_WEB_*` port/token/workspace settings. Pi credentials still come from its agent directory (`PI_CODING_AGENT_DIR` or pi's normal default). If npm 10 reports a peer-resolution error, try `npm ci --legacy-peer-deps`.
 
-For a production build, run `npm run build` and `npm start`, then open `http://127.0.0.1:8788`. Run `npm run typecheck` and `npm test` for the spike's checks.
+For a production build: `npm run build && npm start`, then open `http://127.0.0.1:8788`. Run `npm run typecheck`, `npm run check:protocol`, and `npm test` for the project checks.
 
-This is deliberately a **thin adaptation of Dispatch-WebUI's pi SDK/WebSocket pattern**, not the full Dispatch-WebUI fork described for later phases in [`docs/plan.md`](docs/plan.md). The first prompt streams a reply and fires a versioned `learn:demo` event through `pi.events` into a visible browser card. Sessions are currently in memory (lost on refresh); there is no topic graph, teaching workflow, model picker, terminal, or setup wizard yet. The event is a wiring demonstration, not learning data. See the upstream [Dispatch-WebUI](https://github.com/MichaelT025/DispatchWeb) MIT license retained in [`LICENSE`](LICENSE).
+**What works now:** pi-powered streamed chat with persistent pi sessions, model/auth administration, tool cards, files/search, terminals and Markdown/math. The versioned `learn:demo` event is a visible proof of the pi-events → WebSocket → browser path, **not** stored learning data. Coding-specific SCM, worktree, worker, background-server and subscription screens/APIs are excluded. Topic persistence, knowledge graphs, teaching workflows, source curation, and the learner profile in [`docs/plan.md`](docs/plan.md) are future work—not available yet.
+
+This app began as a fork of [Dispatch-WebUI](https://github.com/MichaelT025/DispatchWeb) at `8dc1df5`. Its MIT attribution is retained in [`LICENSE`](LICENSE).

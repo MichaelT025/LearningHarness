@@ -7,10 +7,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // Dev: Vite serves the web UI on :5173 and proxies the WebSocket + any API
 // traffic to the backend server (which runs separately via `npm run dev:server`).
-// The dev backend is pinned to :8788 (see the dev:server script) so it never
-// collides with a globally-installed pi-web-ui running on the default :8787.
-// Override both with DISPATCH_DEV_PORT / PI_WEB_PORT to run a second checkout
-// (e.g. a worktree) side by side.
+// The isolated dev backend defaults to :8788 (the launcher maps LEARN_PORT
+// to PI_WEB_PORT internally). Override LEARN_PORT and DISPATCH_DEV_PORT to
+// run another local instance side by side.
 const devPort = Number(process.env.DISPATCH_DEV_PORT) || 5173;
 const backendPort = Number(process.env.LEARN_PORT) || 8788;
 const backend = `http://127.0.0.1:${backendPort}`;

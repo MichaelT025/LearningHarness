@@ -32,7 +32,6 @@ function snapshot(conversationId: string, over: Partial<UiState> = {}): UiState 
 		thinkingLevel: "off",
 		availableThinkingLevels: ["off"],
 		queue: { steering: [], followUp: [] },
-		workers: [],
 		tools: ["read"],
 		version: 1,
 		piConfigured: true,
@@ -190,16 +189,6 @@ describe("chatReducer: optimistic new chat", () => {
 		expect(cleared.optimisticNewChat).toBeNull();
 		expect(cleared.activeConversationId).toBe("c1");
 	});
-
-	it("a refused worktree_add clears it (no snapshot will follow)", () => {
-		const pending = chatReducer(shown("c1"), { type: "optimistic_new_chat", cwd: null });
-		const s = chatReducer(pending, {
-			type: "worktree_result",
-			result: { type: "worktree_result", op: "add", ok: false, path: "/proj/a", error: "nope" },
-		});
-		expect(s.optimisticNewChat).toBeNull();
-		expect(s.activeConversationId).toBe("c1");
-	});
 });
 
 describe("chatReducer: snapshot cache + instant switch", () => {
@@ -239,6 +228,22 @@ describe("chatReducer: snapshot cache + instant switch", () => {
 		const back = chatReducer(s, { type: "switch_timeout", id: "c9" });
 		expect(back.switchPending).toBeNull();
 		expect(back.activeConversationId).toBe("c1");
+	});
+
+	it("only shows learning events from the confirmed active conversation", () => {
+		const demo = { version: 1 as const, type: "demo" as const, message: "ready" };
+		let s = shown("c1");
+		s = chatReducer(s, { type: "learn_event", conversationId: "c1", event: demo });
+		expect(s.learnEvent?.event).toBe(demo);
+		s = chatReducer(s, { type: "switch_conversation", id: "c2" });
+		expect(s.learnEvent).toBeNull();
+		// A's delayed event crosses the switch but must not be labeled as B's.
+		const delayed = chatReducer(s, { type: "learn_event", conversationId: "c1", event: demo });
+		expect(delayed).toBe(s);
+		expect(chatReducer(s, { type: "learn_event", conversationId: "c2", event: demo })).toBe(s);
+		s = chatReducer(s, { type: "snapshot", state: snapshot("c2") });
+		s = chatReducer(s, { type: "learn_event", conversationId: "c2", event: demo });
+		expect(s.learnEvent?.conversationId).toBe("c2");
 	});
 
 	it("a delta for the conversation just left refreshes its cache entry, not the view", () => {

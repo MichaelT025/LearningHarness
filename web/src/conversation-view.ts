@@ -7,11 +7,11 @@
  *
  * Client-side state machine (all fields live in use-chat's ChatState):
  *
- *   optimisticNewChat  set by newChat(cwd) / worktree_add / "/new" — the view
+ *   optimisticNewChat  set by newChat(cwd) / "/new" — the view
  *                      is a synthetic empty UiState (booting: true); cleared
  *                      by the next `snapshot` (any conversation: the server
  *                      switches on success and re-snapshots the old chat on
- *                      failure), by a failed worktree_add result, or by the
+ *                      failure), or by the
  *                      15 s safety timeout.
  *   switchPending      set by switchConversation(id) — when a cached snapshot
  *                      of `id` exists it is displayed at once; cleared by the
@@ -58,7 +58,6 @@ export function syntheticNewChat(current: UiState | null, cwd: string | null | u
 		retry: null,
 		compaction: null,
 		pendingQuestion: null,
-		workers: [],
 		stats: {
 			...current.stats,
 			totalMessages: 0,

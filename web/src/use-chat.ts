@@ -4,12 +4,12 @@ import { withToken } from "./auth-token";
 import { appUrl } from "./base-url";
 import type {
 	ClientMessage,
-	BgServer,
 	CommandDef,
 	ConversationSummary,
 	FileContent,
 	FileListing,
 	FileSearchResult,
+	LearnEvent,
 	ModelInfo,
 	ProjectSummary,
 	ProviderKeyInfo,
@@ -27,17 +27,12 @@ import type {
 	UiServiceInfo,
 	UiSettingsState,
 	UiState,
-	UiWorkerTranscript,
 } from "./types";
-
-/** The payload of a `worktree_result` server message. */
-export type WorktreeResult = Extract<ServerMessage, { type: "worktree_result" }>;
 
 import { applyMessageDelta, type MessageDeltaMsg } from "./message-delta";
 import { resolvePendingQuestion, type QuestionSource } from "./pending-question";
 import { cwdKey } from "./components/left-panel-nav";
 import { setAppGlobals, setAppSend } from "./app-globals";
-import { setWorkers } from "./workers-store";
 import { formatNotificationEvent, isNotificationEvent, notificationEventKey } from "./notification-events";
 import { notify } from "./notify";
 import { PROTOCOL_VERSION } from "./protocol-version";
@@ -100,10 +95,6 @@ export interface ChatState {
 	activeConversationId: string;
 	/** Recent workspaces this client opened (left panel project picker). */
 	projects: ProjectSummary[];
-	/** Latest worktree_add / worktree_remove outcome (monotonic `seq` so a
-	 *  repeat of the same outcome is still observed). Consumed by the left
-	 *  panel (dirty-removal confirm) and the composer (creating state). */
-	worktreeResult: (WorktreeResult & { seq: number }) | null;
 	/** Workspace file listing for the right panel. */
 	files: FileListing | null;
 	/** Latest file content fetched for the preview panel (path-matched in the modal). */
@@ -141,6 +132,9 @@ export interface ChatState {
 	/** 待用户回答的模型提问（ask_user_question）——两个引擎共用。服务端是事实源：
 	 *  即时通道（question_pending）+ 快照（UiState.pendingQuestion，见 syncPendingQuestion）。 */
 	question: UiPendingQuestion | null;
+	/** 服务端 learn_event 推送的瞬时学习事件（Phase-0 demo）。边沿触发、
+	 *  不属于快照；切会话 / 新建聊天即清空，避免泄漏到无关的记录里。 */
+	learnEvent: { conversationId: string; event: LearnEvent } | null;
 	/** User command list from .pi/commands.json (terminal left panel). */
 	commands: CommandDef[];
 	commandsPath: string;
@@ -149,13 +143,10 @@ export interface ChatState {
 	slashCommands: SlashCommandInfo[];
 	/** Open terminal tabs (metadata only; streams go through the bridge). */
 	terminals: TerminalMeta[];
-	/** Terminal the SCM/settings panel asked to focus (auto-switch on write ops). */
+	/** Terminal the settings panel asked to focus (auto-switch on write ops). */
 	terminalActiveId: string | null;
 	/** Settings-panel state (system prompt, skill/extension toggles, presets). */
 	settings: UiSettingsState | null;
-	/** AI-started background servers (managed from the 后台任务 panel). The
-	 *  list lives on the client session, so it survives conversation ends. */
-	bgServers: BgServer[];
 	/** Last fetch_models probe result (custom-provider model list), matched by
 	 *  reqId in the model config modal. */
 	fetchModelsResult: {
@@ -181,9 +172,6 @@ export interface ChatState {
 		configs?: UiProviderConfig[];
 		error?: string;
 	} | null;
-	/** Last source-control query result (scm_status / scm_filediff /
-	 *  scm_commit), matched by reqId in the SCM panel. */
-	scmData: ServerMessage | null;
 	/** Last global-search file query result, matched by reqId in the
 	 *  global search panel (stale results with older reqIds are ignored). */
 	fileSearch: {
@@ -199,16 +187,9 @@ export interface ChatState {
 		ok: boolean;
 		results: SessionSearchResult[];
 	} | null;
-	/** Increments when the server reports the watched git dir changed
-	 *  outside the panel — SCMPanel refreshes on change while visible. */
-	scmDirty: number;
 	/** Server wire-protocol version differs from ours — the page was loaded
 	 *  before/after an app update; show a persistent refresh banner. */
 	protocolMismatch: boolean;
-	/** Transcripts of the delegated workers the Workers pane follows
-	 *  (open_worker → worker_transcript pushes), keyed by worker id. Scoped to
-	 *  the ACTIVE conversation: cleared whenever the snapshot switches chats. */
-	workerTranscripts: Map<number, UiWorkerTranscript>;
 	/** Client-only: a new chat was requested and the server has not answered
 	 *  yet. `view` is the synthetic empty UiState App renders meanwhile (see
 	 *  conversation-view.ts for the whole state machine); `seq` lets the
@@ -249,7 +230,6 @@ export type ChatAction =
 			activeId: string;
 	  }
 	| { type: "projects"; projects: ProjectSummary[] }
-	| { type: "worktree_result"; result: WorktreeResult }
 	| { type: "files"; files: FileListing }
 	| { type: "file_changed"; path: string }
 	| { type: "file_content"; content: FileContent }
@@ -269,7 +249,6 @@ export type ChatAction =
 			type: "clone_provider_result";
 			result: { reqId: number; ok: boolean; config?: UiProviderConfig; configs?: UiProviderConfig[]; error?: string };
 	  }
-	| { type: "scm_data"; data: ServerMessage }
 	| {
 			type: "file_search_result";
 			result: {
@@ -287,8 +266,6 @@ export type ChatAction =
 				results: SessionSearchResult[];
 			};
 	  }
-	| { type: "scm_changed" }
-	| { type: "worker_transcript"; conversationId: string; transcript: UiWorkerTranscript }
 	| { type: "install_result"; result: { ok: boolean; detail: string } }
 	| {
 			type: "path_completions";
@@ -310,6 +287,7 @@ export type ChatAction =
 			type: "question";
 			question: UiPendingQuestion | null;
 	  }
+	| { type: "learn_event"; conversationId: string; event: LearnEvent }
 	| { type: "commands"; commands: CommandDef[]; path: string }
 	| { type: "slash_commands"; commands: SlashCommandInfo[] }
 	| { type: "terminal_add"; meta: TerminalMeta }
@@ -319,7 +297,6 @@ export type ChatAction =
 	| { type: "terminal_list"; conversationId?: string; terminals: TerminalInfo[] }
 	| { type: "terminal_active"; id: string }
 	| { type: "settings"; settings: UiSettingsState }
-	| { type: "bg_servers"; servers: BgServer[] }
 	| { type: "optimistic_new_chat"; cwd: string | null }
 	| { type: "optimistic_timeout"; seq: number }
 	| { type: "switch_conversation"; id: string }
@@ -330,6 +307,14 @@ const MAX_TERM_BUFFER = 200_000;
 /** Marker for truncated live output (was "…[前 N 字符已省略]…" / "…[N chars omitted above]…").
  *  ToolCallBlock maps it through the liveOutputOmitted i18n key so only one language shows. */
 const LIVE_OMIT_MARK = "LIVE_OMIT";
+
+/** Runtime guard mirroring server/learn-events.ts: only versioned, well-shaped
+ *  learn events reach the card. A malformed push is dropped silently. */
+function isLearnEvent(value: unknown): value is LearnEvent {
+	if (typeof value !== "object" || value === null) return false;
+	const e = value as Record<string, unknown>;
+	return e.version === 1 && e.type === "demo" && typeof e.message === "string";
+}
 
 /**
  * Bridges terminal output from the socket to live xterm instances. Output for
@@ -343,7 +328,7 @@ interface TerminalWriter {
 
 function makeTerminalBridge() {
 	/** Multiple writers may subscribe to the same (conversation, terminal) pair —
-	 *  e.g. the SCM panel's hidden query terminal parses output through its own
+	 *  e.g. a maintenance command parses output through its own
 	 *  writer while a (hidden) xterm instance may also be registered for it.
 	 *  A Set keeps them all: later registrations no longer shadow earlier ones. */
 	const writers = new Map<string, Set<TerminalWriter>>();
@@ -474,10 +459,12 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 				activeConversationId: action.state.conversationId,
 				liveOutputs: pruneLiveOutputs(state.liveOutputs, action.state),
 				toolStatuses: pruneToolStatuses(state.toolStatuses, action.state),
-				// Another chat's followed workers are meaningless here; the pane
-				// re-opens the selected one after the switch.
-				workerTranscripts:
-					state.state?.conversationId === action.state.conversationId ? state.workerTranscripts : new Map(),
+				// A learn_event is tied to the conversation that was active when it
+				// arrived; a snapshot for any other conversation drops it.
+				learnEvent:
+					state.learnEvent && state.learnEvent.conversationId === action.state.conversationId
+						? state.learnEvent
+						: null,
 				// Any snapshot settles a pending click: the server switched (new
 				// chat / target conversation) or re-snapshotted the old one after
 				// a failure — either way what it sent is what we show.
@@ -532,6 +519,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 				...state,
 				optimisticNewChat: { cwd: action.cwd, view, seq: (state.optimisticNewChat?.seq ?? 0) + 1 },
 				switchPending: null,
+				learnEvent: null,
 				// Sidebar: nothing active until the server names the new chat.
 				activeConversationId: "",
 			};
@@ -552,11 +540,11 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 				...state,
 				optimisticNewChat: null,
 				switchPending: action.id,
+				learnEvent: null,
 				activeConversationId: action.id,
 				...(cached
 					? {
 							state: cached,
-							workerTranscripts: state.state?.conversationId === action.id ? state.workerTranscripts : new Map(),
 						}
 					: {}),
 			};
@@ -632,17 +620,6 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 			};
 		case "projects":
 			return { ...state, projects: action.projects };
-		case "worktree_result":
-			return {
-				...state,
-				worktreeResult: { ...action.result, seq: (state.worktreeResult?.seq ?? 0) + 1 },
-				// A refused checkout never opens a chat — no snapshot will follow.
-				optimisticNewChat: action.result.op === "add" && !action.result.ok ? null : state.optimisticNewChat,
-				activeConversationId:
-					action.result.op === "add" && !action.result.ok && state.optimisticNewChat
-						? (state.state?.conversationId ?? state.activeConversationId)
-						: state.activeConversationId,
-			};
 		case "files":
 			return { ...state, files: action.files };
 		case "file_changed":
@@ -665,20 +642,10 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 			return { ...state, cloneProviderResult: action.result };
 		case "install_result":
 			return { ...state, installResult: action.result };
-		case "scm_data":
-			return { ...state, scmData: action.data };
 		case "file_search_result":
 			return { ...state, fileSearch: action.result };
 		case "session_search_result":
 			return { ...state, sessionSearch: action.result };
-		case "scm_changed":
-			return { ...state, scmDirty: state.scmDirty + 1 };
-		case "worker_transcript": {
-			if (state.state?.conversationId !== action.conversationId) return state;
-			const workerTranscripts = new Map(state.workerTranscripts);
-			workerTranscripts.set(action.transcript.workerId, action.transcript);
-			return { ...state, workerTranscripts };
-		}
 		case "path_completions":
 			return { ...state, pathCompletions: action.completions };
 		case "widgets":
@@ -691,6 +658,11 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 			return { ...state, dialog: action.dialog };
 		case "question":
 			return { ...state, question: action.question };
+		case "learn_event":
+			// An event from the conversation being left must not appear in the
+			// optimistic destination while its server switch is still in flight.
+			if (action.conversationId !== state.activeConversationId || state.optimisticNewChat || state.switchPending) return state;
+			return { ...state, learnEvent: { conversationId: action.conversationId, event: action.event } };
 		case "commands":
 			return {
 				...state,
@@ -701,8 +673,6 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 			return { ...state, slashCommands: action.commands };
 		case "settings":
 			return { ...state, settings: action.settings };
-		case "bg_servers":
-			return { ...state, bgServers: action.servers };
 		case "terminal_add":
 			return { ...state, terminals: [...state.terminals, action.meta] };
 		case "terminal_remove":
@@ -828,7 +798,6 @@ export function initialChatState(): ChatState {
 		conversations: [],
 		activeConversationId: "",
 		projects: [],
-		worktreeResult: null,
 		files: null,
 
 		fileChanged: null,
@@ -845,22 +814,19 @@ export function initialChatState(): ChatState {
 		todos: { tasks: [], nextId: 1, runIds: [], running: false },
 		dialog: null,
 		question: null,
+		learnEvent: null,
 		commands: [],
 		commandsPath: "",
 		slashCommands: [],
 		terminals: [],
 		terminalActiveId: null,
-		bgServers: [],
 		settings: null,
 		fetchModelsResult: null,
 		refreshProviderResult: null,
 		cloneProviderResult: null,
-		scmData: null,
 		fileSearch: null,
 		sessionSearch: null,
-		scmDirty: 0,
 		protocolMismatch: false,
-		workerTranscripts: new Map(),
 		optimisticNewChat: null,
 		switchPending: null,
 		snapshotsById: new Map(),
@@ -958,7 +924,7 @@ export function useChat() {
 		return false;
 	}, []);
 
-	/** Start a new chat (top button, project head, /new, worktree flows):
+	/** Start a new chat (top button, project head, /new):
 	 *  the empty view paints now, the server boots the runtime meanwhile. */
 	const newChat = useCallback((cwd: string | null | undefined) => {
 		if (!sendRaw({ type: "new_chat", cwd: cwd ?? null })) return false;
@@ -976,21 +942,13 @@ export function useChat() {
 
 	/** Every outgoing message funnels through here (appSend included), so
 	 *  the optimistic paths cover callers that only hold a send function:
-	 *  the sidebar's new-chat buttons, the worktree pill, a typed "/new". */
+	 *  the sidebar's new-chat buttons, a typed "/new". */
 	const send = useCallback((msg: ClientMessage): boolean => {
 		switch (msg.type) {
 			case "new_chat":
 				return newChat(msg.cwd);
 			case "switch_conversation":
 				return switchConversation(msg.id);
-			case "worktree_add": {
-				// The chat opens in the checkout once git is done; until then
-				// the empty view sits on the project cwd (the pill shows it as
-				// creating). A refused add clears it via worktree_result.
-				if (!sendRaw(msg)) return false;
-				dispatch({ type: "optimistic_new_chat", cwd: msg.cwd ?? null });
-				return true;
-			}
 			case "prompt": {
 				if (!/^\/new(\s|$)/.test(msg.text.trim())) return sendRaw(msg);
 				if (!sendRaw(msg)) return false;
@@ -1167,9 +1125,6 @@ export function useChat() {
 				case "projects":
 					dispatch({ type: "projects", projects: msg.projects });
 					break;
-				case "worktree_result":
-					dispatch({ type: "worktree_result", result: msg });
-					break;
 				case "files":
 					dispatch({ type: "files", files: msg });
 					break;
@@ -1226,9 +1181,6 @@ export function useChat() {
 						},
 					});
 					break;
-				case "scm_data":
-					dispatch({ type: "scm_data", data: msg });
-					break;
 				case "search_files_result":
 					dispatch({
 						type: "file_search_result",
@@ -1249,12 +1201,6 @@ export function useChat() {
 							results: msg.results,
 						},
 					});
-					break;
-				case "scm_changed":
-					dispatch({ type: "scm_changed" });
-					break;
-				case "worker_transcript":
-					dispatch({ type: "worker_transcript", conversationId: msg.conversationId, transcript: msg.transcript });
 					break;
 				case "install_result":
 					dispatch({ type: "install_result", result: msg });
@@ -1298,6 +1244,13 @@ export function useChat() {
 						},
 					});
 					break;
+				case "learn_event": {
+					// Trust the server's source conversation, not the optimistic
+					// sidebar selection: switches and events may cross in flight.
+					if (!isLearnEvent(msg.event) || typeof msg.conversationId !== "string") break;
+					dispatch({ type: "learn_event", conversationId: msg.conversationId, event: msg.event });
+					break;
+				}
 				case "terminal_output":
 					bridgeRef.current.write(
 						msg.conversationId ?? chatApi.current.chat.activeConversationId,
@@ -1332,9 +1285,6 @@ export function useChat() {
 					break;
 				case "settings_state":
 					dispatch({ type: "settings", settings: msg.settings });
-					break;
-				case "bg_servers":
-					dispatch({ type: "bg_servers", servers: msg.servers });
 					break;
 				default:
 					break;
@@ -1423,8 +1373,7 @@ export function useChat() {
 	// 里的真值，不会出现第二个 source of truth；最多晚一帧（对应默认值只会是
 	//「未就绪 / 未连接 / 空目录」，用户看不出）。
 	// The cwd mirrored is the DISPLAYED one: an optimistic new chat aimed at
-	// another project must highlight that project (sidebar) and show its
-	// checkout (worktree pill) right away.
+	// another project must highlight that project (sidebar) right away.
 	const viewState = chat.optimisticNewChat?.view ?? chat.state;
 	useEffect(() => {
 		setAppGlobals({ ready: chat.ready, status: chat.status, cwd: viewState?.cwd ?? "" });
@@ -1452,11 +1401,6 @@ export function useChat() {
 		const t = setTimeout(() => dispatch({ type: "switch_timeout", id: switchPending }), OPTIMISTIC_TIMEOUT_MS);
 		return () => clearTimeout(t);
 	}, [switchPending]);
-	// Delegated workers mirror for the delegate tool cards (workers-store.ts):
-	// the store dedups by content, so the cards only re-render on real change.
-	useEffect(() => {
-		setWorkers(chat.state?.workers);
-	}, [chat.state?.workers]);
 
 	const dismissNotice = useCallback((id: number) => dispatch({ type: "dismiss_notice", id }), []);
 

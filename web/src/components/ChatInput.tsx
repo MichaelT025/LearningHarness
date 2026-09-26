@@ -1,7 +1,6 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { FiList, FiSquare, FiPlus, FiArrowUp } from "react-icons/fi";
-import type { ProjectSummary, ModelInfo, ProviderKeyInfo, SlashCommandInfo, UiMessage, UiState } from "../types";
-import type { AgentRole } from "../agents";
+import type { ModelInfo, ProviderKeyInfo, SlashCommandInfo, UiMessage, UiState } from "../types";
 import { useT } from "../i18n";
 import { appSend, useAppField } from "../app-globals";
 import { mergeRecalledDraft } from "../composer-draft";
@@ -15,9 +14,6 @@ import { scheduleDeferredCursor } from "../deferred-cursor";
 
 import { ModelThinking } from "./ModelThinking";
 import { ContextUsageIndicator } from "./ContextUsageIndicator";
-import { AgentPicker } from "./AgentPicker";
-import { WorktreePill } from "./WorktreePill";
-import type { WorktreeResult } from "../use-chat";
 
 /** True on touch-first devices (phones / tablets driven by a soft keyboard) —
  *  see `touch-device.ts` for the detection rules (Windows 触屏笔记本不算触屏，
@@ -47,10 +43,6 @@ interface ChatInputProps {
 	contextUsage: UiState["stats"]["contextUsage"] | null | undefined;
 	models: ModelInfo[];
 	modelsLoading: boolean;
-	/** Recent projects with their checkouts — the branch pill finds the
-	 *  active cwd's worktree here. */
-	projects: ProjectSummary[];
-	worktreeResult: (WorktreeResult & { seq: number }) | null;
 	/** Files/folders attached via the right panel / preview, waiting to be sent. */
 	attachments: {
 		path: string;
@@ -83,11 +75,6 @@ interface ChatInputProps {
 	/** Stored API keys per built-in provider (masked) — drives the picker's
 	 *  multi-key grouping (click a model under a key to switch to it). */
 	providerKeys: Record<string, ProviderKeyInfo[]>;
-	/** Dispatch agent picker: CONFIRMED role from the server status bridge
-	 *  (null = unknown; we never show an optimistic local guess). */
-	activeAgent: AgentRole | null;
-	/** Whether the Dispatch extension is loaded (slash /agent + /dispatch, legacy /piastra alias). */
-	agentAvailable: boolean;
 }
 
 export const ChatInput = memo(function ChatInput({
@@ -99,8 +86,6 @@ export const ChatInput = memo(function ChatInput({
 	contextUsage,
 	models,
 	modelsLoading,
-	projects,
-	worktreeResult,
 	attachments,
 	onRemoveAttachment,
 	onAddImageFiles,
@@ -109,8 +94,6 @@ export const ChatInput = memo(function ChatInput({
 	onSent,
 	onManageModels,
 	providerKeys,
-	activeAgent,
-	agentAvailable,
 	recallDrafts,
 }: ChatInputProps) {
 	const t = useT();
@@ -630,7 +613,6 @@ export const ChatInput = memo(function ChatInput({
 		<div
 			ref={composerRef}
 			className="inputbar"
-			data-agent={activeAgent ?? ""}
 			onDragOver={(e) => {
 				// 只做 preventDefault（允许落点 drop）；提示交给全窗口遮罩
 				// （App.tsx 的 .app-drop-overlay），输入条不再叠一层局部遮罩。
@@ -792,21 +774,6 @@ export const ChatInput = memo(function ChatInput({
 						>
 							<FiPlus />
 						</button>
-						<AgentPicker
-							activeRole={activeAgent}
-							available={agentAvailable}
-							busy={streaming || booting}
-							onSelect={(role) => {
-								// Real switch via the EXISTING /agent slash command — the
-								// extension performs model + thinking + tools + setStatus.
-								appSend({ type: "prompt", text: `/agent ${role}` });
-							}}
-						/>
-						<WorktreePill
-							projects={projects}
-							emptyChat={messages.length === 0 && !streaming}
-							worktreeResult={worktreeResult}
-						/>
 					</div>
 					<div className="composer-tools-right">
 						<ContextUsageIndicator usage={contextUsage} />

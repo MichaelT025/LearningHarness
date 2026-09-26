@@ -39,23 +39,10 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { BgServerTracker } from "./bg-servers.js";
-import {
-	createWorktree,
-	generateWorktreeName,
-	isManagedWorktree,
-	listWorktrees,
-	removeWorktree,
-	sameWorktreePath,
-	worktreeIsDirty,
-	WorktreeError,
-	type GitWorktree,
-} from "./worktrees.js";
 import { removeFirstOccurrence } from "./queue-utils.js";
 import { SettingsService } from "./settings-service.js";
 import { SlashCommandsService, parseSlash } from "./slash-commands.js";
 import { ModelAdminService } from "./model-admin.js";
-import { subscriptionUsage } from "./subscriptions.js";
 import { FilesService, MACHINE_ROOT, workspacePath } from "./files-service.js";
 import {
 	isExtensionDisabled,
@@ -104,6 +91,7 @@ import type {
 	UiServiceInfo,
 	UiState,
 } from "./protocol.js";
+import { makeLearnBridgeExtension } from "./learn-events.js";
 import { launchOrigin, toServiceInfo } from "./launch-origin.js";
 import { serializeStreamingMessage, stripTransientRetryErrors, type AgentMessage } from "./serialize.js";
 import { loadCommands, saveCommandsFile, TerminalManager } from "./terminals.js";
@@ -114,7 +102,6 @@ import {
 	serializeTranscript,
 	type SerializeCache,
 } from "./session-preview.js";
-import { isBridgeEvent, WORKER_CHANNEL, WorkerHub } from "./workers.js";
 import { makeInputRequiredNotification, NotificationLifecycle } from "./notification-lifecycle.js";
 
 const SNAPSHOT_INTERVAL_MS = 60;
@@ -161,6 +148,9 @@ export class QuiesceRejectedError extends Error {
 /** 自家内联扩展名（组合模板渲染，见 prompt-composer.ts）。SDK 以其
  *  "<inline:<name>>" 作为 path；扩展白名单/禁用过滤必须放行它。 */
 const INLINE_PERSONA_EXT = "<inline:pi-webui-persona>";
+/** 自家内联扩展（learn:demo 事件桥，见 learn-events.ts）。同 persona 一样是
+ *  基础设施，不参与禁用过滤。SDK 以 "<inline:<name>>" 作为 path。 */
+const INLINE_LEARN_EXT = "<inline:pi-webui-learn>";
 
 /** Pi 包文档路径（composer 的 {{pi_docs}} 自动内容用）。随安装位置解析一次。 */
 const PI_DOC_PATHS = (() => {
@@ -496,9 +486,6 @@ const TOOL_WATCHDOG_TIMEOUT_MS = (() => {
  *  runtime alive; conversations of other projects keep their own lists).
  *  子代理不计入：子代理是 inMemory 后台任务，不参与此上限，既不占位也不被此上限拦截。 */
 const MAX_OPEN_CONVERSATIONS = 8;
-/** Coalescing window for worker_transcript pushes: a streaming worker emits
- *  a bridge event per token; followers need a few refreshes a second. */
-const WORKER_PUSH_INTERVAL_MS = 200;
 const DEFAULT_CONV_TITLE = "新对话";
 
 /** First user text in a session, truncated for the conversation list. */
@@ -666,33 +653,14 @@ export class ClientSession {
 	/** Live AbortControllers of THIS client's running bash tool calls — aborting
 	 *  them kills only the command (agent run and conversation continue). */
 	private bashKills = new Set<AbortController>();
-	/** Background-server tracking (port snapshots + 后台任务 panel state) —
-	 *  自包含模块，见 bg-servers.ts。列表按 CLIENT 存活，不随对话切换/结束消失。 */
 	/** 文件树 / 预览读写 / SCM 查询 / watcher —— 自包含模块，见 files-service.ts。 */
 	private readonly files = new FilesService({
 		emit: (msg) => this.emit(msg),
 		isDisposed: () => this.disposed,
 		getCwd: () => this.cwd,
 		getActiveCwd: () => this.conv?.cwd ?? this.cwd,
-		// issue #91：文件服务错误文案按客户端 UI 语言出中英（英文默认）。
-		getLang: () => this.getLang(),
 	});
-	private readonly bg = new BgServerTracker({
-		emit: (msg) => this.emit(msg),
-		flushSnapshot: () => this.flushSnapshot(),
-		isDisposed: () => this.disposed,
-	});
-	/** Delegated-worker state per conversation id (PiAstra `delegate` tool),
-	 *  fed by the extension's `piastra:workers` event channel through the
-	 *  inline pi-webui-workers extension (see makeRuntimeFactory). Keyed
-	 *  separately from `convs`: bridge events can arrive before the
-	 *  Conversation record exists and the hub must survive runtime swaps. */
-	private readonly workerHubs = new Map<string, WorkerHub>();
-	/** The extension event bus of each conversation's runtime — lets the
-	 *  server send `discover` / `cancel` requests back to the extension. */
-	private readonly workerBuses = new Map<string, { emit: (channel: string, data: unknown) => void }>();
-	/** Throttle state for worker_transcript pushes, keyed `<convId>:<workerId>`. */
-	private readonly workerPushTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
 
 	/** The active conversation (all session operations target it). */
 	private get conv(): Conversation {
@@ -1039,13 +1007,6 @@ export class ClientSession {
 	 *  filesystem — failures silently fall back to the poll. */
 	private fsWatcher: ReturnType<typeof watch> | null = null;
 	private watchPath: string | null = null;
-	/** fs.watch on the active repo's git dir — external changes (CLI commit,
-	 *  IDE branch switch) push `scm_changed` so the panel refreshes itself.
-	 *  One watcher per client session, re-targeted when the queried cwd
-	 *  changes; failures (bare repo, unsupported fs) silently disable it. */
-	private gitWatcher: ReturnType<typeof watch> | null = null;
-	private gitWatchCwd: string | null = null;
-	private gitDirtyTimer: ReturnType<typeof setTimeout> | null = null;
 	private watchTimer: ReturnType<typeof setTimeout> | null = null;
 
 	// -----------------------------------------------------------------------
@@ -1101,9 +1062,6 @@ export class ClientSession {
 			},
 			pushModels: async () => this.listModels(),
 		});
-		// Prune dead background tasks every 30s (only spawns netstat/lsof while
-		// the list is non-empty). unref: must not keep the process alive.
-		this.bg.start();
 	}
 
 	static async create(clientId: string, cwd: string, stateStore: ClientStateStore): Promise<ClientSession> {
@@ -1115,10 +1073,9 @@ export class ClientSession {
 		const runtime = await createAgentSessionRuntime(cs.makeRuntimeFactory(terminals, conversationId), {
 			cwd,
 			agentDir,
-			// Resume the most recent session for this project — the SDK default
-			// per-project dir (<agentDir>/sessions/--<cwd>--/, shared with the
-			// pi CLI/TUI) — or start a fresh one on first visit.
-			sessionManager: SessionManager.continueRecent(cwd),
+			// Resume this project's most recent session (from the configured flat
+			// session root, or pi's per-project default when unset); otherwise start fresh.
+			sessionManager: SessionManager.continueRecent(cwd, piSessionsRoot()),
 		});
 		// First conversation = the resumed session; it also seeds the shared
 		// ModelRuntime that every later conversation reuses.
@@ -1197,7 +1154,8 @@ export class ClientSession {
 					// npm:<pkg> 候选键。
 					extensionsOverride: (res) => {
 						// 自家内联扩展是基础设施，不参与禁用过滤。
-						const keepOwn = (e: { path: string }) => !e.path.startsWith(INLINE_PERSONA_EXT);
+						const keepOwn = (e: { path: string }) =>
+							e.path.startsWith(INLINE_PERSONA_EXT) || e.path.startsWith(INLINE_LEARN_EXT);
 						return {
 							...res,
 							extensions: res.extensions.filter(
@@ -1211,17 +1169,21 @@ export class ClientSession {
 					// 的 systemPromptOptions，永远最新）。
 					extensionFactories: [
 						{
-							// Worker bridge: subscribe to PiAstra's public worker channel on
-							// the runtime's shared extension event bus. Routed by ownerId
-							// (conversation id) — a background chat's workers never leak
-							// into the active pane.
-							name: "pi-webui-workers",
+							// learn:demo 事件桥（见 learn-events.ts）：每 run 在 agent_start
+							// 时 emit 一次，经版本校验后以 learn_event 经 ClientSession.emit
+							// 推给前端。订阅在 factory 体内注册一次（不在 agent_start 里），
+							// 重复 prompt / runtime reload 不会叠加监听；ownerId 门控保证只有
+							// 活跃对话的事件才上屏，后台对话的不冒泡到当前聊天。
+							name: "pi-webui-learn",
 							hidden: true,
-							factory: (pi) => {
-								if (!ownerId) return;
-								this.workerBuses.set(ownerId, pi.events);
-								pi.events.on(WORKER_CHANNEL, (event: unknown) => this.onWorkerEvent(ownerId, event));
-							},
+							factory: makeLearnBridgeExtension(
+								(event) => {
+									if (ownerId === undefined || this.activeId === ownerId) {
+										this.emit({ type: "learn_event", conversationId: ownerId ?? this.activeId, event });
+									}
+								},
+								() => ownerId === undefined || this.activeId === ownerId,
+							),
 						},
 						{
 							name: "pi-webui-persona",
@@ -1341,88 +1303,6 @@ export class ClientSession {
 		};
 	}
 
-	// ---- delegated workers (PiAstra) ---------------------------------------
-
-	private workerHub(convId: string): WorkerHub {
-		let hub = this.workerHubs.get(convId);
-		if (!hub) {
-			hub = new WorkerHub(this.agentDir);
-			this.workerHubs.set(convId, hub);
-		}
-		return hub;
-	}
-
-	private dropWorkerState(convId: string): void {
-		this.workerHubs.delete(convId);
-		this.workerBuses.delete(convId);
-		for (const key of [...this.workerPushTimers.keys()]) {
-			if (key.startsWith(`${convId}:`)) {
-				clearTimeout(this.workerPushTimers.get(key));
-				this.workerPushTimers.delete(key);
-			}
-		}
-	}
-
-	/** A `piastra:workers` bridge event from the conversation's extension. */
-	private onWorkerEvent(convId: string, event: unknown): void {
-		if (this.disposed || !isBridgeEvent(event)) return;
-		const hub = this.workerHub(convId);
-		if (event.type === "workers") {
-			if (!hub.applyList(event.workers)) return;
-			if (convId === this.activeId) this.scheduleSnapshot();
-			// Status flips (finished, cancelled) matter to followers too.
-			for (const id of hub.open) this.scheduleWorkerPush(convId, id);
-			return;
-		}
-		if (hub.applyTranscript(event.workerId, event.messages, event.streaming) && hub.open.has(event.workerId)) {
-			this.scheduleWorkerPush(convId, event.workerId);
-		}
-	}
-
-	/** Coalesce transcript pushes per worker (token deltas arrive per event). */
-	private scheduleWorkerPush(convId: string, workerId: number): void {
-		const key = `${convId}:${workerId}`;
-		if (this.workerPushTimers.has(key)) return;
-		this.workerPushTimers.set(
-			key,
-			setTimeout(() => {
-				this.workerPushTimers.delete(key);
-				void this.pushWorkerTranscript(convId, workerId);
-			}, WORKER_PUSH_INTERVAL_MS),
-		);
-	}
-
-	private async pushWorkerTranscript(convId: string, workerId: number): Promise<void> {
-		const hub = this.workerHubs.get(convId);
-		if (!hub || !hub.open.has(workerId) || this.disposed) return;
-		const transcript = await hub.transcript(workerId);
-		if (this.disposed || !hub.open.has(workerId)) return;
-		this.emit({ type: "worker_transcript", conversationId: convId, transcript });
-	}
-
-	/** Follow one worker of the ACTIVE conversation: reply now, push on change. */
-	async openWorker(workerId: number): Promise<void> {
-		const convId = this.activeId;
-		const hub = this.workerHub(convId);
-		if (!hub.has(workerId)) return;
-		hub.open.add(workerId);
-		// A worker that finished in memory may not have streamed to us yet
-		// (opened after the fact): ask the extension for its final messages.
-		this.workerBuses.get(convId)?.emit(WORKER_CHANNEL, { version: 1, type: "transcript_request", workerId });
-		await this.pushWorkerTranscript(convId, workerId);
-	}
-
-	closeWorker(workerId: number): void {
-		this.workerHubs.get(this.activeId)?.open.delete(workerId);
-	}
-
-	/** Abort ONE running worker (the extension reports it as `cancelled`). */
-	cancelWorker(workerId: number): void {
-		const hub = this.workerHubs.get(this.activeId);
-		if (!hub?.has(workerId)) return;
-		this.workerBuses.get(this.activeId)?.emit(WORKER_CHANNEL, { version: 1, type: "cancel", workerId });
-	}
-
 	/** Summaries of conversations currently streaming — captured at shutdown
 	 *  so the next attach can tell the user their run was interrupted. */
 	streamingSummaries(): { title: string; cwd: string }[] {
@@ -1471,9 +1351,6 @@ export class ClientSession {
 		// Reconnect: push the settings panel state (prompt text/mode, skill &
 		// extension toggles, saved presets).
 		this.pushSettings();
-		// Reconnect: push the background-task list — it must survive reconnects
-		// and outlive the conversation that started the tasks.
-		this.bg.push();
 		// Reconnect: push the built-in provider key list (multi-key grouping in the
 		// model picker needs it even before the client asks).
 		this.modelAdmin.listProviderKeys();
@@ -1550,9 +1427,6 @@ export class ClientSession {
 		});
 		this.pushActiveStatuses();
 		conv.unsubscribe = conv.session.subscribe((event) => this.onEvent(conv, event));
-		// A replacement runtime (or a reload) re-registers the extension with an
-		// empty worker map; ask it to republish so the pane matches.
-		this.workerBuses.get(conv.id)?.emit(WORKER_CHANNEL, { version: 1, type: "discover" });
 		// 新会话 / 切换会话 / 强杀重建的必经之路：刚创建的 runtime 用的是 SDK
 		// 默认重试 3 次——这里把面板的 retryMaxAttempts 覆盖注入，否则“设了 6
 		// 次还是按 3 次重试”。已存在会话重复注入是幂等的（同值覆盖）。
@@ -1747,9 +1621,6 @@ export class ClientSession {
 				conv.toolStartTimes.set(event.toolCallId, Date.now());
 				// Snapshot listeners before a bash run — the post-run diff catches
 				// servers the agent started in the background.
-				if (event.toolName === "bash") {
-					this.bg.snapshotBefore();
-				}
 				// 看门狗豁免：ask_user_question 阻塞等的是「人类回答」，不是挂死的工具
 				// （默认 20 分钟会把还在思考的用户连对话一起剁掉）。它的收场自有路子：
 				// 用户回答/取消、会话 dispose（cancelPendingQuestions），不限时。
@@ -1774,7 +1645,6 @@ export class ClientSession {
 				this.clearToolWatchdog(conv, event.toolCallId);
 				// Bash finished — wait briefly for background servers to bind their
 				// ports, then diff against the pre-run snapshot and record them.
-				if (event.toolName === "bash") void this.bg.trackAfterBash();
 				const durationMs = startedAt !== undefined ? Date.now() - startedAt : undefined;
 				// The bash tool does not put its exit code in result.details — on
 				// failure it throws "Command exited with code N" and the agent
@@ -1945,7 +1815,7 @@ export class ClientSession {
 					queuedSteering: conv.queueSteering,
 					queuedFollowUp: conv.queueFollowUp,
 					retrying,
-					workers: this.workerHub(conv.id).list(),
+					workers: [],
 				});
 				if (notification) this.emit(notification);
 				break;
@@ -2158,7 +2028,6 @@ export class ClientSession {
 			retry: conv.retryState ?? null,
 			compaction: conv.compactionState ?? null,
 			pendingQuestion: this.pendingQuestionForSnapshot(),
-			workers: this.workerHub(conv.id).list(),
 			tools: state.tools.map((t) => t.name),
 			version: ++this.version,
 			piConfigured: this.isPiConfigured(),
@@ -2533,12 +2402,7 @@ export class ClientSession {
 	/** 模型/服务商配置管理 —— 自包含模块，见 model-admin.ts。 */
 	private readonly modelAdmin!: ModelAdminService;
 
-	/** Account-level quotas use the same native auth/runtime as this client's chats. */
-	getSubscriptions(providerId?: string) {
-		return providerId
-			? subscriptionUsage.refresh(this.sharedModelRuntime!, providerId)
-			: subscriptionUsage.read(this.sharedModelRuntime!);
-	}
+
 
 	/** Persist an api-key credential for a provider (auth.json). */
 	setProviderApiKey(provider: string, apiKey: string): Promise<void> {
@@ -3121,30 +2985,9 @@ export class ClientSession {
 		this.flushSnapshot();
 	}
 
-	/** Re-push the current list on request (panel opened); prunes dead entries first. */
-	async listBgServers(): Promise<void> {
-		await this.bg.listAndPush();
-	}
-
-	/** 插件任务集合变化时由宿主调用：重推一次 bg_servers（含插件任务）。 */
-	refreshBgTasks(): void {
-		this.bg.push();
-	}
-
 	/** For index.ts paths that need to emit a notice (emit is private). */
 	emitNotice(level: "info" | "warning" | "error", text: string): void {
 		this.emit({ type: "notice", level, text });
-	}
-
-	/** Kill ONE background server (by port); returns whether anything was killed. */
-	async killBackgroundServer(port: number | undefined): Promise<boolean> {
-		if (typeof port !== "number") return false;
-		return this.bg.killOne(port);
-	}
-
-	/** Kill every background server the agent started; returns the freed ports. */
-	async killAllBackgroundServers(): Promise<string[]> {
-		return this.bg.killAll();
 	}
 
 	/** Kill only the running bash command(s) — the agent run itself continues
@@ -3252,7 +3095,7 @@ export class ClientSession {
 			const runtime = await createAgentSessionRuntime(this.makeRuntimeFactory(conv.terminals, conv.id), {
 				cwd: conv.cwd,
 				agentDir: this.agentDir,
-				sessionManager: SessionManager.continueRecent(conv.cwd),
+				sessionManager: SessionManager.continueRecent(conv.cwd, piSessionsRoot()),
 			});
 			conv.runtime = runtime;
 			conv.session = runtime.session;
@@ -3371,7 +3214,7 @@ export class ClientSession {
 			const runtime = await createAgentSessionRuntime(this.makeRuntimeFactory(terminals, conversationId), {
 				cwd: this.cwd,
 				agentDir: this.agentDir,
-				sessionManager: SessionManager.create(this.cwd),
+				sessionManager: SessionManager.create(this.cwd, piSessionsRoot()),
 			});
 			const conv = this.makeConversation(runtime, conversationId, terminals);
 			this.convs.set(conv.id, conv);
@@ -3419,7 +3262,6 @@ export class ClientSession {
 	 * — the project has zero open conversations by definition.
 	 */
 	private async newChatInWorkspace(abs: string): Promise<boolean> {
-		this.files.unwatchGit(); // stale repo's watcher must not fire across projects
 		// The outgoing conversation is left behind — apply the running-list
 		// lifecycle (removal is deferred until the new chat exists). Roll the
 		// presentation-only `listed` promotion back if the boot fails.
@@ -3436,7 +3278,7 @@ export class ClientSession {
 			const runtime = await createAgentSessionRuntime(this.makeRuntimeFactory(terminals, conversationId), {
 				cwd: abs,
 				agentDir: this.agentDir,
-				sessionManager: SessionManager.create(abs),
+				sessionManager: SessionManager.create(abs, piSessionsRoot()),
 			});
 			await this.activateFreshConversation(this.makeConversation(runtime, conversationId, terminals), displaced);
 		} catch (err) {
@@ -3515,7 +3357,6 @@ export class ClientSession {
 		this.convs.delete(id);
 		this.convStatuses.remove(id);
 		this.convTodos.delete(id);
-		this.dropWorkerState(id);
 		this.clearAllToolWatchdogs(conv);
 		conv.notificationLifecycle.reset();
 		conv.terminals.killAll();
@@ -3611,24 +3452,6 @@ export class ClientSession {
 	 * never pollutes or races the active cwd's fridge.
 	 */
 	private sessionInfosCache = new Map<string, { infos: SessionInfo[]; at: number }>();
-	/** `git worktree list` per repository, keyed by the folded path of EVERY
-	 *  checkout of that repository so sibling worktrees share one git call.
-	 *  Short TTL: pushProjects runs on each list_projects and after every
-	 *  project switch. */
-	private worktreeCache = new Map<string, { list: GitWorktree[]; at: number }>();
-	private static readonly WORKTREE_CACHE_TTL = 5000;
-
-	private async repoWorktrees(dir: string): Promise<GitWorktree[]> {
-		const now = Date.now();
-		const c = this.worktreeCache.get(cwdKey(dir));
-		if (c && now - c.at < ClientSession.WORKTREE_CACHE_TTL) return c.list;
-		const list = (await listWorktrees(dir)).filter((w) => !w.prunable && !w.bare);
-		const entry = { list, at: now };
-		this.worktreeCache.set(cwdKey(dir), entry);
-		for (const w of list) this.worktreeCache.set(cwdKey(w.path), entry);
-		return list;
-	}
-
 	/** Folded cwd key → the spelling the sidebar groups under. Transcripts can
 	 *  store a cwd in another case (`c:\...` from a CLI run); listings and
 	 *  refreshes must be echoed under the canonical spelling or the client ends
@@ -3700,107 +3523,6 @@ export class ClientSession {
 		}
 	}
 
-	/**
-	 * Create (or reuse) the worktree for `branch` and open a blank chat in it.
-	 * The chat is an ordinary conversation whose cwd is the worktree, so every
-	 * tool, terminal and delegated worker of that chat runs there — the main
-	 * checkout is never touched. A worktree that was created but whose chat
-	 * failed to open is kept and its path reported, as in the CLI.
-	 */
-	async addWorktree(cwd?: string, branch?: string): Promise<void> {
-		if (this.quiesceBlocked()) return;
-		const dir = cwd ? resolve(cwd) : this.cwd;
-		const name = (branch ?? "").trim() || generateWorktreeName();
-		let created: { path: string; branch: string; existed: boolean };
-		try {
-			created = await createWorktree(dir, name);
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			this.emit({ type: "worktree_result", op: "add", ok: false, path: dir, branch: name, error: message });
-			this.emit({ type: "notice", level: "error", text: `Could not create worktree ${name}: ${message}` });
-			return;
-		}
-		this.worktreeCache.clear();
-		const opened = await this.newChat(created.path);
-		this.emit({ type: "worktree_result", op: "add", ok: opened, path: created.path, branch: created.branch });
-		if (!opened) {
-			this.emit({
-				type: "notice",
-				level: "warning",
-				text: `Worktree ${created.branch} is ready at ${created.path}, but no chat was opened there. Open it from the sidebar.`,
-			});
-		}
-		void this.pushProjects();
-	}
-
-	/**
-	 * Remove a linked worktree (branch kept). Idle chats open in it are closed
-	 * first — their runtimes hold the directory open, which on Windows makes
-	 * the delete fail — and the active chat moves to another conversation or
-	 * to a blank chat in the main checkout. A streaming chat or one with live
-	 * terminals refuses, like dismiss_conversation does.
-	 */
-	async removeWorktree(path: string, force = false): Promise<void> {
-		if (this.quiesceBlocked()) return;
-		const target = resolve(path);
-		const refuse = (error: string) => {
-			this.emit({ type: "worktree_result", op: "remove", ok: false, path: target, error });
-			this.emit({ type: "notice", level: "warning", text: error });
-		};
-		const inTarget = [...this.convs.values()].filter((c) => sameWorktreePath(c.cwd, target));
-		for (const c of inTarget) {
-			let streaming = true;
-			try {
-				streaming = c.session.isStreaming;
-			} catch {
-				/* runtime being replaced — treat as busy */
-			}
-			if (streaming) return refuse(`Chat "${c.title}" is still running in this worktree — stop it before removing`);
-			if (c.terminals.countLive() > 0) {
-				return refuse(`Chat "${c.title}" still has open terminals in this worktree — close them before removing`);
-			}
-		}
-		if (inTarget.some((c) => c.id === this.activeId)) {
-			const other = [...this.convs.values()].find((c) => c.listed && !sameWorktreePath(c.cwd, target));
-			if (other) {
-				await this.switchConversation(other.id);
-			} else {
-				const main = (await listWorktrees(target))[0]?.path;
-				if (!main || !(await this.newChat(main))) {
-					return refuse("Could not move the active chat out of the worktree; it was not removed");
-				}
-			}
-			if (inTarget.some((c) => c.id === this.activeId)) {
-				return refuse("Could not move the active chat out of the worktree; it was not removed");
-			}
-		}
-		const branch = (await listWorktrees(target)).find((w) => sameWorktreePath(w.path, target))?.branch ?? undefined;
-		try {
-			// Dirty check before closing chats, so a refused removal leaves the
-			// user's open chats exactly where they were.
-			if (!force && (await worktreeIsDirty(target))) throw new WorktreeError("uncommitted changes", true);
-			for (const c of inTarget) this.removeConversation(c.id);
-			if (inTarget.length > 0) this.emitConversations();
-			const removed = await removeWorktree(target, force);
-			this.worktreeCache.clear();
-			this.emit({ type: "worktree_result", op: "remove", ok: true, path: target, branch: removed.branch ?? undefined });
-			this.emit({
-				type: "notice",
-				level: "info",
-				text: `Removed worktree ${removed.branch ?? target} (branch kept)`,
-			});
-			// Its history rows still show under the project; the transcripts
-			// stay on disk and can be reopened (the chat then runs in a cwd
-			// that no longer exists — pi's own resume rules apply).
-			void this.pushProjects();
-		} catch (err) {
-			const dirty = err instanceof WorktreeError && err.dirty;
-			const message = err instanceof Error ? err.message : String(err);
-			this.emit({ type: "worktree_result", op: "remove", ok: false, path: target, branch, dirty, error: message });
-			if (!dirty) this.emit({ type: "notice", level: "error", text: `Could not remove worktree: ${message}` });
-		}
-	}
-
 	/** Remove an entry from the client's recent-project list (UI state only). */
 	async removeProject(path: string): Promise<void> {
 		this.stateStore.removeProject(this.clientId, path);
@@ -3823,9 +3545,9 @@ export class ClientSession {
 	async deleteSession(path: string): Promise<void> {
 		try {
 			const abs = resolve(path);
-			// Guardrail: only transcripts under the shared sessions root
-			// (<agentDir>/sessions/) may be deleted — never arbitrary files.
-			const sessionsRoot = resolve(this.agentDir, "sessions");
+			// Guardrail: only transcripts under this app's configured sessions root
+			// may be deleted — never arbitrary files.
+			const sessionsRoot = resolve(piSessionsRoot() ?? resolve(this.agentDir, "sessions"));
 			if (!abs.startsWith(sessionsRoot + sep)) {
 				this.emit({
 					type: "notice",
@@ -3920,7 +3642,7 @@ export class ClientSession {
 			const trimmed = (name ?? "").trim();
 			if (!trimmed) return;
 			const abs = resolve(path);
-			const sessionsRoot = resolve(this.agentDir, "sessions");
+			const sessionsRoot = resolve(piSessionsRoot() ?? resolve(this.agentDir, "sessions"));
 			if (!abs.startsWith(sessionsRoot + sep)) {
 				this.emit({
 					type: "notice",
@@ -4420,13 +4142,12 @@ export class ClientSession {
 			}
 			this.canonicalCwd = canonical;
 
-			// Group candidates by repository. A repo root (main or linked
-			// checkout) resolves to its `git worktree list`; the first entry is
-			// the main checkout and becomes the project.
+			// LearningHarness: no worktree grouping — every repo checkout (or
+			// saved directory) is its own project; linked checkouts are NOT
+			// folded into a main checkout.
 			interface Group {
 				path: string;
 				lastUsed: number;
-				worktrees: GitWorktree[] | null;
 			}
 			const groups = new Map<string, Group>();
 			const bump = (g: Group, t: number) => {
@@ -4437,20 +4158,10 @@ export class ClientSession {
 				const path = canonical.get(key) ?? key;
 				if (path === this.projectlessCwd) continue;
 				const t = Math.max(savedLastUsed.get(key) ?? 0, latestByKey.get(key) ?? 0);
-				if (isRepoRoot(path)) {
-					const list = await this.repoWorktrees(path);
-					const main = list.length > 0 ? spelling(list[0].path) : path;
-					const mainKey = cwdKey(main);
-					let g = groups.get(mainKey);
-					if (!g) {
-						g = { path: main, lastUsed: 0, worktrees: list.length > 0 ? list : null };
-						groups.set(mainKey, g);
-					}
-					bump(g, t);
-				} else if (savedLastUsed.has(key)) {
+				if (isRepoRoot(path) || savedLastUsed.has(key)) {
 					let g = groups.get(key);
 					if (!g) {
-						g = { path, lastUsed: 0, worktrees: null };
+						g = { path, lastUsed: 0 };
 						groups.set(key, g);
 					}
 					bump(g, t);
@@ -4462,19 +4173,7 @@ export class ClientSession {
 			// the user) stay hidden even though session files still mention them.
 			const projects: ProjectSummary[] = [...groups.values()]
 				.filter((g) => !removedKeys.has(cwdKey(g.path)) && existsSync(g.path))
-				.map((g) => {
-					const worktrees = g.worktrees
-						?.filter((w) => existsSync(w.path))
-						.map((w, i) => ({
-							path: spelling(w.path),
-							branch: w.branch,
-							head: w.head.slice(0, 8),
-							isMain: i === 0,
-							locked: w.locked,
-							managed: isManagedWorktree(w.path),
-						}));
-					return worktrees ? { path: g.path, lastUsed: g.lastUsed, worktrees } : { path: g.path, lastUsed: g.lastUsed };
-				})
+				.map((g) => ({ path: g.path, lastUsed: g.lastUsed }))
 				.sort((a, b) => b.lastUsed - a.lastUsed)
 				.slice(0, 20);
 			this.emit({ type: "projects", projects });
@@ -4484,7 +4183,6 @@ export class ClientSession {
 			const known = new Set<string>();
 			for (const p of projects) {
 				known.add(cwdKey(p.path));
-				for (const w of p.worktrees ?? []) known.add(cwdKey(w.path));
 			}
 			const detached = [...latestByKey.entries()]
 				.filter(([key]) => !known.has(key) && !removedKeys.has(key))
@@ -4540,15 +4238,6 @@ export class ClientSession {
 		} catch {
 			this.emit({ type: "session_search_results", reqId, query, ok: false, results: [] });
 		}
-	}
-
-	/** SCM 只读查询（结构化 JSON，reqId 匹配）。 */
-	async scmQuery(
-		kind: "status" | "history" | "filediff" | "commit",
-		reqId: number,
-		arg?: { path?: string; hash?: string },
-	): Promise<void> {
-		return this.files.scmQuery(kind, reqId, arg);
 	}
 
 	/** Read a workspace file for the preview panel (size-capped, binary-safe). */
@@ -4685,7 +4374,6 @@ export class ClientSession {
 
 	async setCwd(newCwd: string): Promise<void> {
 		try {
-			this.files.unwatchGit(); // stale repo's watcher must not fire across projects
 			const abs = await this.resolveWorkspaceTarget(newCwd);
 			if (abs === null) return;
 			if (abs === this.cwd) {
@@ -4722,7 +4410,7 @@ export class ClientSession {
 				const newRuntime = await createAgentSessionRuntime(this.makeRuntimeFactory(terminals, conversationId), {
 					cwd: abs,
 					agentDir: this.agentDir,
-					sessionManager: SessionManager.continueRecent(abs),
+					sessionManager: SessionManager.continueRecent(abs, piSessionsRoot()),
 				});
 				await this.activateFreshConversation(this.makeConversation(newRuntime, conversationId, terminals), displaced);
 			}
@@ -4878,14 +4566,10 @@ export class ClientSession {
 			clearInterval(this.stallTimer);
 			this.stallTimer = null;
 		}
-		for (const timer of this.workerPushTimers.values()) clearTimeout(timer);
-		this.workerPushTimers.clear();
 		this.files.unwatchDir();
-		this.files.unwatchGit();
 		this.webUi.dispose();
 		// 关闭所有挂起的用户提问（dispose 时以「取消」解析，避免模型挂死）。
 		this.cancelPendingQuestions();
-		this.bg.stop();
 		for (const conv of this.convs.values()) {
 			this.clearAllToolWatchdogs(conv);
 			conv.notificationLifecycle.reset();

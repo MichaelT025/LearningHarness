@@ -62,8 +62,8 @@ export function TerminalPanel({ chat, terminal }: TerminalPanelProps) {
 		}
 	}, [chat.terminals, activeId]);
 
-	// The SCM / settings panel asked to focus a specific terminal tab (git write
-	// ops, uninstall runs) — follow the request so the user sees the command run.
+	// The settings panel asked to focus a specific terminal tab (uninstall
+	// runs) — follow the request so the user sees the command run.
 	useEffect(() => {
 		if (chat.terminalActiveId) {
 			setActiveId(chat.terminalActiveId);

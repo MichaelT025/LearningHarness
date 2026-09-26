@@ -1,19 +1,16 @@
 /**
  * Left-panel navigation tree — pure, testable derivation of the unified
- * sidebar (Codex-style: project directories with chats nested under each).
+ * sidebar (project directories with chats nested under each).
  *
  * Kept side-effect free so the grouping/nesting/order rules can be unit-tested
  * without a DOM. The component only renders whatever this returns.
  */
-import type { ConversationSummary, ProjectSummary, SessionSummary, WorktreeSummary } from "../types";
+import type { ConversationSummary, ProjectSummary, SessionSummary } from "../types";
 
 /** A running conversation row (depth kept for the nested-row layout). */
 export interface NavConversation {
 	c: ConversationSummary;
 	depth: number;
-	/** The linked worktree the chat runs in (undefined in the main checkout
-	 *  or outside git) — drives the branch badge and the remove action. */
-	worktree?: WorktreeSummary;
 }
 
 /** One top-level navigation group (a workspace directory). */
@@ -30,17 +27,11 @@ export interface NavGroup {
 	lastUsed: number;
 	/** Running conversations under this group. */
 	conversations: NavConversation[];
-	/** History sessions under this group, matched by the group's cwd — for a
-	 *  repository, by ANY of its checkouts (merged, newest first). */
+	/** History sessions under this group, matched by the group's cwd. */
 	sessions: SessionSummary[];
-	/** Linked worktree per history session path (folded), for sessions that
-	 *  live in one. Absent for main-checkout sessions. */
-	sessionWorktrees: ReadonlyMap<string, WorktreeSummary>;
-	/** Every checkout of the project's repository, main first; [] outside git. */
-	worktrees: WorktreeSummary[];
 	/** Directories whose history this group shows and that are NOT the active
-	 *  cwd (whose listing arrives through the unscoped `list_sessions`). Main
-	 *  checkout first, then linked worktrees. */
+	 *  cwd (whose listing arrives through the unscoped `list_sessions`).
+	 *  Flat groups track exactly one cwd, so this is either [path] or []. */
 	fetchCwds: string[];
 }
 
@@ -67,56 +58,27 @@ export function flattenConversations(list: ConversationSummary[]): NavConversati
 	return list.map((c) => ({ c, depth: 0 }));
 }
 
-/** Badge text for a linked worktree: its branch, else the short HEAD. */
-export function worktreeLabel(w: WorktreeSummary): string {
-	return w.branch ?? w.head;
-}
-
 function makeGroup(
 	path: string,
 	isProject: boolean,
 	lastUsed: number,
-	worktrees: WorktreeSummary[],
 	convsByKey: Map<string, ConversationSummary[]>,
 	sessionsByKey: ReadonlyMap<string, SessionSummary[]>,
 	currentCwd: string,
 ): NavGroup {
 	const currentKey = cwdKey(currentCwd);
-	// Chats in a linked worktree are matched by that checkout's cwd; the
-	// badge names its branch so two chats of one repo read as different work.
-	const cwds = worktrees.length > 0 ? worktrees.map((w) => w.path) : [path];
-	const linkedByKey = new Map<string, WorktreeSummary>();
-	for (const w of worktrees) if (!w.isMain) linkedByKey.set(cwdKey(w.path), w);
-	const conversations: NavConversation[] = [];
-	const sessions: SessionSummary[] = [];
-	const sessionWorktrees = new Map<string, WorktreeSummary>();
-	const seenSessions = new Set<string>();
-	let isCurrent = false;
-	for (const cwd of cwds) {
-		const k = cwdKey(cwd);
-		if (k === currentKey) isCurrent = true;
-		const worktree = linkedByKey.get(k);
-		for (const c of convsByKey.get(k) ?? []) conversations.push(worktree ? { c, depth: 0, worktree } : { c, depth: 0 });
-		for (const s of sessionsByKey.get(k) ?? []) {
-			const pk = cwdKey(s.path);
-			if (seenSessions.has(pk)) continue;
-			seenSessions.add(pk);
-			sessions.push(s);
-			if (worktree) sessionWorktrees.set(pk, worktree);
-		}
-	}
-	sessions.sort((a, b) => b.modified - a.modified);
+	const key = cwdKey(path);
+	const conversations = (convsByKey.get(key) ?? []).map((c) => ({ c, depth: 0 }));
+	const sessions = [...(sessionsByKey.get(key) ?? [])].sort((a, b) => b.modified - a.modified);
 	return {
 		path,
 		label: basename(path),
 		isProject,
-		isCurrent,
+		isCurrent: key === currentKey,
 		lastUsed,
 		conversations,
 		sessions,
-		sessionWorktrees,
-		worktrees,
-		fetchCwds: cwds.filter((cwd) => cwdKey(cwd) !== currentKey),
+		fetchCwds: key === currentKey ? [] : [path],
 	};
 }
 
@@ -149,8 +111,7 @@ function makeGroup(
  *  - the directory is not the current cwd — the mount/reconnect effect lists
  *    the active cwd separately with an unscoped `list_sessions` (whose reply
  *    is echoed with the active cwd), so requesting it again here would only
- *    duplicate. A repository group asks for each of its OTHER checkouts
- *    (`fetchCwds`), so a project's worktree chats load alongside its own;
+ *    duplicate;
  *  - it is expanded (`collapsed` holds only the user-collapsed paths);
  *  - it has no request currently in flight (avoids request storms while the
  *    reply is on the wire);
@@ -228,22 +189,19 @@ export function buildLeftNav(
 		}
 	}
 
-	// A project claims its main checkout AND every linked worktree.
 	const known = new Set<string>();
 	const groups: NavGroup[] = [];
 
 	for (const p of projects) {
-		const worktrees = p.worktrees ?? [];
 		known.add(cwdKey(p.path));
-		for (const w of worktrees) known.add(cwdKey(w.path));
-		groups.push(makeGroup(p.path, true, p.lastUsed, worktrees, convsByKey, sessionsByKey, currentCwd));
+		groups.push(makeGroup(p.path, true, p.lastUsed, convsByKey, sessionsByKey, currentCwd));
 	}
 
 	const ungroupedKeys = [...new Set([...convsByKey.keys(), ...sessionsByKey.keys()])]
 		.filter((key) => !known.has(key))
 		.sort();
 	for (const key of ungroupedKeys) {
-		groups.push(makeGroup(spelling.get(key) ?? key, false, 0, [], convsByKey, sessionsByKey, currentCwd));
+		groups.push(makeGroup(spelling.get(key) ?? key, false, 0, convsByKey, sessionsByKey, currentCwd));
 	}
 
 	groups.sort((a, b) => {
@@ -279,11 +237,10 @@ function segments(path: string): string[] {
 }
 
 /**
- * Two workspaces can share a basename (a worktree checkout next to the main
- * repo, "PiAstra" in two parent folders). Showing both as "PiAstra" reads as a
- * duplicate bug, so colliding project labels grow the nearest distinguishing
- * parent: "4cb0/PiAstra" vs "Personal/PiAstra". Non-colliding labels are
- * untouched. Mutates in place.
+ * Two workspaces can share a basename ("PiAstra" in two parent folders).
+ * Showing both as "PiAstra" reads as a duplicate bug, so colliding project
+ * labels grow the nearest distinguishing parent: "4cb0/PiAstra" vs
+ * "Personal/PiAstra". Non-colliding labels are untouched. Mutates in place.
  */
 export function disambiguateLabels(groups: NavGroup[]): void {
 	const byLabel = new Map<string, NavGroup[]>();

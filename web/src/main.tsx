@@ -9,7 +9,6 @@ import "./css/composer.css";
 import "./css/workspace.css";
 import "./css/polish.css";
 import "./css/minimap.css";
-import "./css/workers.css";
 import "./css/todos.css";
 import "highlight.js/styles/github-dark.css";
 import { initAuthToken } from "./auth-token";

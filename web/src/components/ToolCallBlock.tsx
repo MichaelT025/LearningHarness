@@ -1,6 +1,5 @@
-import { memo, useEffect, useMemo, useState, type ComponentType } from "react";
+import { memo, useState, type ComponentType } from "react";
 import {
-	FiArrowRight,
 	FiCheckCircle,
 	FiChevronDown,
 	FiChevronRight,
@@ -18,26 +17,11 @@ import {
 	FiUsers,
 	FiX,
 } from "react-icons/fi";
-import type { ToolStatus, UiMessage, UiToolCallBlock, UiWorker } from "../types";
+import type { ToolStatus, UiMessage, UiToolCallBlock } from "../types";
 import { useT } from "../i18n";
-import { parseDelegateTasks, toolArgHints } from "../tool-args";
+import { toolArgHints } from "../tool-args";
 import { toolSummary } from "../tool-summary";
-import {
-	formatElapsed,
-	isWorkerActive,
-	workerElapsedSec,
-	workersForCall,
-	workerStatusLabel,
-	workerStatusTone,
-} from "../workers";
-import { useDelegateLiveState, useWorkers } from "../workers-store";
-import { RoleChip } from "./RoleChip";
 import { shimmerPhase } from "../shimmer";
-
-/** Window event the delegate card fires to open one worker in the Workers
- *  pane (App.tsx listens; the card sits deep in the memoized message tree).
- *  detail = worker id, or null for the pane's list. */
-export const OPEN_WORKER_EVENT = "pi-web-ui:open-worker";
 
 export interface ToolView {
 	/** Tool result message if the tool already finished. */
@@ -94,8 +78,7 @@ export const ToolCallBlock = memo(function ToolCallBlock({
 	forceOpen?: boolean;
 }) {
 	const t = useT();
-	// null = 未手动点过 → 跟随开关：wrap=true（开）→ 全部展开；wrap=false（关）→ 全部折叠。
-	// 与 ThinkingBlock 一致——开关切换时自动折叠/展开所有未手动点过的工具。
+	// null = 未手动点过 → 跟随开关
 	const [open, setOpen] = useState<boolean | null>(null);
 	const isError = view.result?.isError ?? view.status?.isError ?? false;
 	// 错误卡也默认折叠——标题行的 ✕ 徽标已标出失败，点击即可看输出。
@@ -104,13 +87,9 @@ export const ToolCallBlock = memo(function ToolCallBlock({
 	const shown = expanded || forceOpen;
 	const [copied, setCopied] = useState(false);
 
-	// PiAstra delegate returns as soon as its workers START (async
-	// delegation); the card stays "running" until the last worker lands.
-	const isDelegate = block.name === "delegate";
-	const workersRunning = useDelegateLiveState(isDelegate ? block.id : null) === "running";
-	const running = (!view.result && view.streaming && !view.status) || workersRunning;
+	const running = !view.result && view.streaming && !view.status;
 	const isBashRunning = block.name === "bash" && running;
-	const done = view.result !== undefined && !workersRunning;
+	const done = view.result !== undefined;
 	/** Command finished (tool_status fired) but the authoritative toolResult
 	 *  message hasn't landed in a snapshot yet — the model is still chewing on
 	 *  the result. */
@@ -120,9 +99,6 @@ export const ToolCallBlock = memo(function ToolCallBlock({
 		? view.result.content.map((b) => (b.type === "text" ? b.text : "")).join("")
 		: (view.liveOutput ?? "");
 	const output = rawOutput.replace(/…\[LIVE_OMIT:(\d+)\]…\n/, (_, n) => t("liveOutputOmitted", { n }));
-	// PiAstra delegate: the card body is the live worker roster (workers-store),
-	// not the raw arguments; the result text is a status dump, so hide it
-	// unless the call itself failed.
 
 	const statusClass = isError ? "err" : done ? "ok" : running || waitingModel ? "run" : "idle";
 	let statusLabel = isError
@@ -224,20 +200,6 @@ export const ToolCallBlock = memo(function ToolCallBlock({
 						<span>{t("stopBash")}</span>
 					</button>
 				)}
-				{isDelegate && (
-					<button
-						type="button"
-						className="toolcall-open"
-						title={t("workersOpenPane")}
-						onClick={(e) => {
-							e.stopPropagation();
-							window.dispatchEvent(new CustomEvent<number | null>(OPEN_WORKER_EVENT, { detail: null }));
-						}}
-					>
-						<FiArrowRight />
-						<span>{t("workersOpenPane")}</span>
-					</button>
-				)}
 				{shown && (
 					<button
 						type="button"
@@ -257,16 +219,12 @@ export const ToolCallBlock = memo(function ToolCallBlock({
 					<div className="toolcall-raw-name">
 						<code>{block.name}</code>
 					</div>
-					{isDelegate ? (
-						<DelegateWorkers toolCallId={block.id} argumentsText={block.argumentsText} result={view.result} />
-					) : (
-						block.argumentsText && (
-							<div className="toolcall-args">
-								{bashCommand ? <TerminalCommand command={bashCommand} /> : <pre>{block.argumentsText}</pre>}
-							</div>
-						)
+					{block.argumentsText && (
+						<div className="toolcall-args">
+							{bashCommand ? <TerminalCommand command={bashCommand} /> : <pre>{block.argumentsText}</pre>}
+						</div>
 					)}
-					{(!isDelegate || isError) && output.length > 0 && (
+					{output.length > 0 && (
 						<div className="toolcall-output">
 							<div className="toolcall-output-label">
 								{isError ? t("errorOutput") : t("output")}
@@ -275,7 +233,7 @@ export const ToolCallBlock = memo(function ToolCallBlock({
 							<pre>{output}</pre>
 						</div>
 					)}
-					{!isDelegate && running && output.length === 0 && (
+					{running && output.length === 0 && (
 						<div className="toolcall-waiting">
 							<span className="cursor" /> {t("waitingOutput")}
 						</div>
@@ -297,101 +255,6 @@ function TerminalCommand({ command }: { command: string }) {
 		<div className="termline">
 			<FiTerminal className="termline-icon" />
 			<code>{command}</code>
-		</div>
-	);
-}
-
-/**
- * Delegate card body: one row per worker of THIS call (live from the workers
- * store, or the roster saved in the result for old sessions), each opening
- * that worker's transcript in the Workers pane. Before the extension has
- * reported anything, the tasks the orchestrator wrote stand in.
- */
-function DelegateWorkers({
-	toolCallId,
-	argumentsText,
-	result,
-}: {
-	toolCallId: string;
-	argumentsText?: string;
-	result?: UiMessage;
-}) {
-	const t = useT();
-	const all = useWorkers();
-	const workers = useMemo(() => workersForCall(all, toolCallId, result), [all, toolCallId, result]);
-	const tasks = useMemo(
-		() => (workers.length === 0 ? parseDelegateTasks(argumentsText) : []),
-		[workers.length, argumentsText],
-	);
-	const anyActive = workers.some((w) => isWorkerActive(w.status));
-	const [now, setNow] = useState(() => Date.now());
-	useEffect(() => {
-		if (!anyActive) return;
-		const id = setInterval(() => setNow(Date.now()), 1000);
-		return () => clearInterval(id);
-	}, [anyActive]);
-	if (workers.length === 0) {
-		if (tasks.length === 0) return null;
-		return (
-			<div className="delegate-workers">
-				{tasks.map((task, i) => (
-					<div className="delegate-worker pending" data-role={task.role} key={i}>
-						<div className="delegate-worker-head">
-							<RoleChip role={task.role} />
-							{task.access && <span className="delegate-worker-access">{task.access}</span>}
-							<span className="worker-status">{t("workersPending")}</span>
-						</div>
-						<div className="delegate-worker-task">{task.task}</div>
-					</div>
-				))}
-			</div>
-		);
-	}
-	return (
-		<div className="delegate-workers">
-			{workers.map((w) => (
-				<DelegateWorkerRow key={w.id} worker={w} now={now} />
-			))}
-		</div>
-	);
-}
-
-function DelegateWorkerRow({ worker, now }: { worker: UiWorker; now: number }) {
-	const t = useT();
-	const running = isWorkerActive(worker.status);
-	const open = () => window.dispatchEvent(new CustomEvent<number | null>(OPEN_WORKER_EVENT, { detail: worker.id }));
-	return (
-		<div
-			className={`delegate-worker tone-${workerStatusTone(worker.status)}`}
-			data-role={worker.role}
-			role="button"
-			tabIndex={0}
-			title={t("workersOpenOne")}
-			onClick={open}
-			onKeyDown={(e) => {
-				if (e.key === "Enter" || e.key === " ") {
-					e.preventDefault();
-					open();
-				}
-			}}
-		>
-			<div className="delegate-worker-head">
-				<RoleChip role={worker.role} />
-				<span className="worker-id">#{worker.id}</span>
-				<span
-					className={`worker-status${running ? " shimmer" : ""}`}
-					style={running ? shimmerPhase(worker.id) : undefined}
-				>
-					{workerStatusLabel(worker.status)}
-				</span>
-				<span className="worker-elapsed">{formatElapsed(workerElapsedSec(worker, now))}</span>
-				<span className="worker-spacer" />
-				<FiArrowRight className="delegate-worker-go" aria-hidden="true" />
-			</div>
-			<div className="delegate-worker-task" title={worker.task}>
-				{worker.task}
-			</div>
-			<div className="delegate-worker-activity">{worker.activity}</div>
 		</div>
 	);
 }

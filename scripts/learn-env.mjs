@@ -9,6 +9,8 @@ export function learnServerEnv() {
     ...process.env,
     PI_WEB_PORT: String(Number(process.env.LEARN_PORT) || 8788),
     PI_WEB_HOST: "127.0.0.1",
+    PI_WEB_ALLOW_HOSTS: "localhost,127.0.0.1",
+    PI_WEB_ALLOW_ORIGINS: "",
     PI_WEB_CWD: resolve(process.env.LEARN_CWD ?? process.cwd()),
     PI_WEB_DATA_DIR: dataDir,
     PI_WEB_PKG_ROOT: resolve(process.cwd()),
@@ -19,5 +21,8 @@ export function learnServerEnv() {
   // A parent Dispatch instance may protect its own UI with a token. A local
   // LearningHarness login uses pi credentials, not that instance's web token.
   delete env.PI_WEB_TOKEN;
+  // A parent Dispatch process may be restricted to chat only; our retained
+  // terminal/search/settings controls must not disappear with its tab policy.
+  delete env.PI_WEB_TABS;
   return env;
 }

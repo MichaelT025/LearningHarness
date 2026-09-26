@@ -291,8 +291,8 @@ function notificationOptions(body?: string, sticky = false, options?: NotifyOpti
 		requireInteraction: sticky,
 		// appUrl keeps the icon path valid under nginx sub-path deployments
 		// (e.g. /pi/); root deployments resolve to the exact same URL.
-		icon: appUrl("/icons/icon-192.png"),
-		badge: appUrl("/icons/icon-192.png"),
+		icon: appUrl("/favicon.svg"),
+		badge: appUrl("/favicon.svg"),
 		// 故意**不**用 tag。Windows 上「同 tag 的新通知只是替换旧条目」是静默的
 		// —— 没有横幅、没有提示音，而且系统通知中心里只要还躺着一条旧通知，
 		// 后续每一条都会被无声替换掉（实测：手动清空通知中心后才能再弹一次；

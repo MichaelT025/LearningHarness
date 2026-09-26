@@ -187,14 +187,6 @@
 	color: #fff;
 	background: var(--red);
 }
-/* third slot on a repository head: new chat in a fresh worktree */
-.lp-group-head .lp-del.lp-project-worktree {
-	right: 56px;
-}
-.lp-group-head:has(.lp-project-worktree) .lp-group-main {
-	padding-right: 80px;
-}
-
 /* ---- nested chat rows: plain text, indented under the folder name ---- */
 .lp-group-body {
 	padding: 0 0 6px 0;
@@ -248,31 +240,6 @@
 	margin-left: 0;
 	line-height: 1.4;
 }
-/* worktree marker: a chat/session row that runs in a linked checkout. Sits
-   in the row's left gutter (the 32px title indent), so titles line up
-   whether or not a row has one; the branch name is in the tooltip. Mint,
-   not accent: the shell theme greys the accent out. */
-.lp-nav .session-item {
-	position: relative;
-}
-.lp-nav .lp-branch {
-	position: absolute;
-	left: 8px;
-	top: 50%;
-	transform: translateY(-50%);
-	display: inline-flex;
-	align-items: center;
-	justify-content: center;
-	width: 18px;
-	height: 18px;
-	border-radius: 5px;
-	color: var(--green);
-	background: var(--green-soft);
-}
-.lp-nav .lp-branch svg {
-	width: 13px;
-	height: 13px;
-}
 .lp-nav .subagent-badge {
 	color: var(--text-dim);
 	background: transparent;
@@ -295,13 +262,6 @@
 }
 .lp-row .lp-del.lp-rename {
 	right: 32px;
-}
-/* third slot: remove the row's worktree (only rows with a branch marker) */
-.lp-row .lp-del.lp-row-worktree {
-	right: 58px;
-}
-.lp-row:has(.lp-row-worktree):hover .session-item {
-	padding-right: 86px;
 }
 .lp-row .lp-del:hover,
 .lp-row .lp-del.lp-rename:hover {

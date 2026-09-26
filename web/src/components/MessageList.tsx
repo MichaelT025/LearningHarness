@@ -756,7 +756,7 @@ export function MessageList({
 				{state.messages.length === 0 && !state.streamingMessage && (
 					<div className="empty-state astra-empty">
 						<Logo size={44} className="astra-empty-logo" />
-						<div className="astra-empty-mark">Dispatch Web</div>
+						<div className="astra-empty-mark">LearningHarness</div>
 						<div className="astra-empty-hint">{t("astraEmptyHint")}</div>
 					</div>
 				)}

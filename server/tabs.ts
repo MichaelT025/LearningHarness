@@ -1,11 +1,9 @@
 /**
  * tabs — choose what an instance offers.
  *
- * pi-web-ui shows Chat, Terminal, Git, Search, Background tasks and Settings,
- * always, plus a tab per installed plugin. On the machine you are working on
- * that is the point of the tool. Exposed to other people it is not: Terminal
- * opens a shell as the server's user, and Git shows the working copy with
- * commit and diff a click away. Today there is no way to leave those out.
+ * LearningHarness offers Chat, Terminal, Search and Settings, plus optional
+ * plugin tabs. Terminal opens a shell as the server's user; when exposing the
+ * app beyond the local machine it must be possible to disable that tab.
  *
  * `PI_WEB_TABS=chat,search,settings` is that way. Absent — the default —
  * means every tab, so nothing changes for anybody who does not set it.
@@ -20,7 +18,7 @@
  */
 
 /** Every tab that can be listed. `chat` is always on and is listed for symmetry. */
-export const ALL_TABS = ["chat", "terminal", "git", "search", "tasks", "settings", "plugins"] as const;
+export const ALL_TABS = ["chat", "terminal", "search", "settings", "plugins"] as const;
 
 export type Tab = (typeof ALL_TABS)[number];
 
@@ -37,8 +35,6 @@ export type Tab = (typeof ALL_TABS)[number];
  */
 const OWNED: Partial<Record<Tab, readonly string[]>> = {
 	terminal: ["terminal_create", "terminal_input", "terminal_resize", "terminal_kill", "rename_terminal", "run_command"],
-	git: ["scm_status", "scm_history", "scm_filediff", "scm_commit"],
-	tasks: ["list_bg_servers", "kill_background_server", "kill_background_servers"],
 	search: ["search_files", "search_sessions"],
 };
 

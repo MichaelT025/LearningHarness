@@ -1,16 +1,14 @@
 /**
  * Files service — 从 agent-service.ts 抽出（文件树列目录 / 预览读写 / 路径补全 /
- * SCM 只读查询 / 目录与 git-dir watcher）。
+ * 目录 watcher）。
  *
- * 全部为无状态 fs 操作 + 两个自持的 watcher（当前列出目录、git dir），
+ * 全部为无状态 fs 操作 + 一个自持的 watcher（当前列出目录），
  * 经 FilesHost 回调与 ClientSession 解耦。
  */
 import { mkdirSync, statSync, writeFileSync, watch } from "node:fs";
 import { resolve, relative, sep } from "node:path";
 import type { ServerMessage, FileEntry, FileSearchResult } from "./protocol.js";
-import type { ServerLang } from "./i18n.js";
 import { previewKind, looksLikeText, decodeText, hexDump, countLines } from "./text-sniff.js";
-import { gitDirOf, isNotRepoError, scmStatus, scmHistory, scmFileDiff, scmCommitDetail } from "./scm.js";
 
 export const IS_WIN32 = process.platform === "win32";
 
@@ -183,14 +181,8 @@ export interface FilesHost {
 	isDisposed: () => boolean;
 	/** 文件面板 / 预览读写 / 补全的工作区根（服务启动 cwd 或会话 cwd）。 */
 	getCwd: () => string;
-	/** SCM 查询的工作区（当前活动对话所属项目，可能与 getCwd 不同）。 */
+	/** 活动对话所属项目的工作区（全局搜索的作用域，可能与 getCwd 不同）。 */
 	getActiveCwd: () => string;
-	/**
-	 * 服务端语言（issue #91）：单字段错误通道（scm_data.error、抛错 message 插值）
-	 * 经 pick 按此选中文/英文；推 UI 的 notice 已是 text+textEn 双字段，不用它。
-	 * 缺省英文。agent-service 接线 () => this.getLang()。
-	 */
-	getLang?: () => ServerLang;
 }
 
 export class FilesService {
@@ -205,11 +197,6 @@ export class FilesService {
 	private watchRoot: string | null = null;
 	/** 已对哪个工作区根提示过「实时监听不可用，已回落轮询」——只提示一次。 */
 	private degradedNoticedFor: string | null = null;
-	// ---- git dir watcher ----
-	private gitWatcher: ReturnType<typeof watch> | null = null;
-	private gitWatchCwd: string | null = null;
-	private gitDirtyTimer: ReturnType<typeof setTimeout> | null = null;
-
 	constructor(private readonly host: FilesHost) {}
 
 	/** 机器根列目录（此电脑/盘符列表）；posix 上就是根 "/"。 */
@@ -229,11 +216,6 @@ export class FilesService {
 			return out;
 		}
 		return [{ name: "/", path: "/", type: "dir" }];
-	}
-
-	/** 单字段错误文本的语言（host 未接线时英文默认）。 */
-	private lang(): ServerLang {
-		return this.host.getLang?.() ?? "en";
 	}
 
 	/** 目录列表失败的 notice：缺失路径（ENOENT/ENOTDIR）是删除/改名等正常场景，
@@ -401,133 +383,6 @@ export class FilesService {
 			});
 		} catch {
 			this.host.emit({ type: "search_files_result", reqId, ok: false, results: [] });
-		}
-	}
-
-	/**
-	 * Source-control panel: read-only git queries via server-side execFile
-	 * (no shell, no prompts). Always responds with an scm_data message echoing
-	 * reqId so the client's request matching never stalls. Also (re)arms the
-	 * git-dir watcher so external repo changes push scm_changed.
-	 */
-	async scmQuery(
-		kind: "status" | "history" | "filediff" | "commit",
-		reqId: number,
-		arg?: { path?: string; hash?: string },
-	): Promise<void> {
-		const cwd = this.host.getActiveCwd();
-		if (kind === "status") this.watchGitDir(cwd);
-		try {
-			if (kind === "status") {
-				const data = await scmStatus(cwd, () => this.lang());
-				this.host.emit({ type: "scm_data", reqId, kind, ok: true, ...data });
-				return;
-			}
-			if (kind === "history") {
-				const history = await scmHistory(cwd, () => this.lang());
-				this.host.emit({ type: "scm_data", reqId, kind, ok: true, history });
-				return;
-			}
-			if (kind === "filediff" && arg?.path) {
-				// Path stays inside the workspace (defense in depth — paths come
-				// from our own listing, and execFile passes args verbatim anyway).
-				const { resolve, relative } = await import("node:path");
-				const rel = relative(resolve(cwd), resolve(cwd, arg.path));
-				if (rel.startsWith("..") || rel === "") throw new Error("Path is outside the workspace");
-				const { staged, worktree } = await scmFileDiff(cwd, arg.path, () => this.lang());
-				this.host.emit({
-					type: "scm_data",
-					reqId,
-					kind,
-					ok: true,
-					stagedText: staged,
-					worktreeText: worktree,
-				});
-				return;
-			}
-			if (kind === "commit" && arg?.hash && /^[0-9a-f]{7,40}$/i.test(arg.hash)) {
-				const text = await scmCommitDetail(cwd, arg.hash, () => this.lang());
-				this.host.emit({ type: "scm_data", reqId, kind, ok: true, text });
-				return;
-			}
-			throw new Error("Invalid scm query arguments");
-		} catch (err) {
-			if (isNotRepoError(err)) {
-				// Not a repo — a valid empty answer so the panel shows its hint.
-				this.host.emit({
-					type: "scm_data",
-					reqId,
-					kind,
-					ok: true,
-					notRepo: true,
-					branch: "",
-					detached: false,
-					upstream: null,
-					ahead: 0,
-					behind: 0,
-					upstreamGone: false,
-					files: [],
-					branches: [],
-					stats: {},
-					history: [],
-				});
-				this.unwatchGit();
-				return;
-			}
-			this.host.emit({
-				type: "scm_data",
-				reqId,
-				kind,
-				ok: false,
-				error: err instanceof Error ? err.message : String(err),
-			});
-		}
-	}
-
-	/**
-	 * Watch the active repo's git dir (HEAD / index / packed-refs live at the
-	 * top level, which covers commit / stage / checkout). Re-targets when the
-	 * queried workspace changes. Uses `git rev-parse --absolute-git-dir` so
-	 * worktrees and submodules resolve to the real dir.
-	 */
-	private async watchGitDir(cwd: string): Promise<void> {
-		if (this.gitWatchCwd === cwd && this.gitWatcher) return;
-		this.unwatchGit();
-		this.gitWatchCwd = cwd;
-		try {
-			const gitDir = await gitDirOf(cwd);
-			if (!gitDir) return;
-			this.gitWatcher = watch(gitDir, { persistent: false }, () => {
-				if (this.host.isDisposed() || this.gitDirtyTimer) return;
-				// Debounce: one checkout/commit fires several fs events.
-				this.gitDirtyTimer = setTimeout(() => {
-					this.gitDirtyTimer = null;
-					this.host.emit({ type: "scm_changed" });
-				}, 600);
-			});
-			this.gitWatcher.on("error", () => {
-				// Unsupported filesystem — silently fall back to manual refresh.
-				this.unwatchGit();
-			});
-		} catch {
-			// no .git here (or git missing) — watcher stays off; queries still work
-			this.unwatchGit();
-		}
-	}
-
-	unwatchGit(): void {
-		if (this.gitWatcher) {
-			try {
-				this.gitWatcher.close();
-			} catch {
-				// already gone
-			}
-		}
-		this.gitWatcher = null;
-		this.gitWatchCwd = null;
-		if (this.gitDirtyTimer) {
-			clearTimeout(this.gitDirtyTimer);
-			this.gitDirtyTimer = null;
 		}
 	}
 

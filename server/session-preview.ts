@@ -171,7 +171,6 @@ export function buildPreviewState(input: PreviewStateInput): UiState {
 		retry: null,
 		compaction: null,
 		pendingQuestion: null,
-		workers: [],
 		tools: [],
 		version: input.version,
 		piConfigured: input.piConfigured,

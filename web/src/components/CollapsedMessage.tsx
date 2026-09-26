@@ -9,7 +9,6 @@ import { toolArgHints } from "../tool-args";
 import { thinkingPreviewLine } from "../thinking-preview";
 
 import { parseSkillBlock } from "../skill-block";
-import { WORKER_RESULT_TYPE, workerResultPreview, workerResultsFromDetails } from "./WorkerResultCard";
 
 interface CollapsedMessageProps {
 	message: UiMessage;
@@ -46,17 +45,8 @@ function clip(s: string, max = PREVIEW_MAX): string {
 export const CollapsedMessage = memo(function CollapsedMessage({ message, onExpand }: CollapsedMessageProps) {
 	const t = useT();
 
-	// Worker results: "review #13 finished, fast #12 failed" instead of the
-	// model-facing text dump.
-	const workerResults =
-		message.role === "custom" && message.customType === WORKER_RESULT_TYPE
-			? workerResultsFromDetails(message.details)
-			: [];
-
 	const lines: Line[] = [];
-	if (workerResults.length > 0) {
-		lines.push({ kind: "text", text: workerResultPreview(workerResults, t) });
-	} else if (message.role === "custom" && message.customType === "file") {
+	if (message.role === "custom" && message.customType === "file") {
 		// Attached files get their name as the preview.
 		const details = (message.details ?? {}) as { name?: string; path?: string };
 		lines.push({ kind: "text", text: details.name ?? details.path ?? "" });
@@ -120,9 +110,7 @@ export const CollapsedMessage = memo(function CollapsedMessage({ message, onExpa
 			<span className={`msg-collapsed-role role-${message.role}`}>
 				{message.role === "custom" && message.customType === "file"
 					? t("attachment")
-					: workerResults.length > 0
-						? t("workerResultsLabel")
-						: roleLabel(message.role, t)}
+					: roleLabel(message.role, t)}
 			</span>
 			<span className="msg-collapsed-body">
 				{shownLines.map((l, i) =>

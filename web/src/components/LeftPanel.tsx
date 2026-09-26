@@ -6,23 +6,19 @@ import {
 	FiChevronsLeft,
 	FiEdit2,
 	FiFolder,
-	FiGitBranch,
 	FiPlus,
 	FiSearch,
 	FiTrash2,
 	FiX,
 } from "react-icons/fi";
-import type { ConversationSummary, ProjectSummary, SessionSummary, WorktreeSummary } from "../types";
-import type { WorktreeResult } from "../use-chat";
+import type { ConversationSummary, ProjectSummary, SessionSummary } from "../types";
 import { useT } from "../i18n";
 import { Logo } from "./Logo";
 import { useAppField } from "../app-globals";
 import {
 	buildLeftNav,
-	cwdKey,
 	pendingSessionCwds,
 	stableProjectOrder,
-	worktreeLabel,
 	type NavGroup,
 } from "./left-panel-nav";
 
@@ -39,9 +35,6 @@ interface LeftPanelProps {
 	sessionsByCwd: Map<string, SessionSummary[]>;
 	projects: ProjectSummary[];
 	activeConversationId: string;
-	/** Latest worktree_add/remove outcome — a dirty-removal refusal asks
-	 *  for confirmation here and retries with force. */
-	worktreeResult: (WorktreeResult & { seq: number }) | null;
 	panelSend: (
 		msg:
 			| { type: "new_chat"; cwd?: string | null }
@@ -52,8 +45,6 @@ interface LeftPanelProps {
 			| { type: "switch_conversation"; id: string }
 			| { type: "set_cwd"; path: string }
 			| { type: "remove_project"; path: string }
-			| { type: "worktree_add"; cwd?: string; branch?: string }
-			| { type: "worktree_remove"; path: string; force?: boolean }
 			| { type: "delete_session"; path: string }
 			| { type: "rename_session"; path: string; name: string }
 			| { type: "rename_conversation"; id: string; name: string }
@@ -103,7 +94,6 @@ export const LeftPanel = memo(function LeftPanel({
 	sessionsByCwd,
 	projects,
 	activeConversationId,
-	worktreeResult,
 	panelSend,
 	active,
 	collapsible,
@@ -186,18 +176,6 @@ export const LeftPanel = memo(function LeftPanel({
 		return () => window.clearTimeout(id);
 	}, [pendingTarget]);
 
-	// A worktree removal refused for uncommitted changes: confirm, then force.
-	const seenWorktreeSeq = useRef(0);
-	useEffect(() => {
-		if (!worktreeResult || worktreeResult.seq === seenWorktreeSeq.current) return;
-		seenWorktreeSeq.current = worktreeResult.seq;
-		if (worktreeResult.op !== "remove" || worktreeResult.ok || !worktreeResult.dirty) return;
-		const label = worktreeResult.branch ?? worktreeResult.path;
-		if (window.confirm(t("removeWorktreeDirtyConfirm", { branch: label }))) {
-			panelSend({ type: "worktree_remove", path: worktreeResult.path, force: true });
-		}
-	}, [worktreeResult, panelSend, t]);
-
 	// 可见且展开的项目都在这里惰性拉取历史：新发现的非当前项目、默认展开但从未
 	// 加载的分组都会补上；折叠分组不动。已加载成功的分组仅在重连刷新时重拉一次。
 	useEffect(() => {
@@ -251,35 +229,7 @@ export const LeftPanel = memo(function LeftPanel({
 		);
 	};
 
-	/** Worktree marker for a chat that runs in a linked checkout of its
-	 *  project (Claude-desktop style: rows stay flat, the glyph tells them
-	 *  apart). Sits before the title; the branch name lives in the tooltip. */
-	const branchBadge = (worktree: WorktreeSummary | undefined) => {
-		if (!worktree) return null;
-		const branch = worktreeLabel(worktree);
-		return (
-			<span className="lp-branch" title={t("worktreeBranch", { branch })} aria-label={branch}>
-				<FiGitBranch aria-hidden="true" />
-			</span>
-		);
-	};
-
-	/** Hover action on a worktree-backed row: remove the checkout (branch
-	 *  kept). Two-step like the other destructive buttons; a dirty checkout
-	 *  comes back as worktree_result{dirty} and is confirmed above. */
-	const removeWorktreeButton = (rowKey: string, worktree: WorktreeSummary | undefined) =>
-		worktree
-			? delButton(
-					`wt:${rowKey}`,
-					t("removeWorktree", { branch: worktreeLabel(worktree) }),
-					t("removeWorktreeConfirm"),
-					() => panelSend({ type: "worktree_remove", path: worktree.path }),
-					<FiGitBranch />,
-					"lp-row-worktree",
-				)
-			: null;
-
-	const renderConversationRow = (c: ConversationSummary, depth: number, worktree?: WorktreeSummary) => {
+	const renderConversationRow = (c: ConversationSummary, depth: number) => {
 		const active = activeConversationId === c.id;
 		const pending = pendingTarget === c.id && !active;
 		const key = `conv:${c.id}`;
@@ -301,7 +251,6 @@ export const LeftPanel = memo(function LeftPanel({
 					}}
 				>
 					<span className="session-info">
-						{renaming === key ? null : branchBadge(worktree)}
 						{renaming === key ? (
 							<input
 								autoFocus
@@ -344,7 +293,6 @@ export const LeftPanel = memo(function LeftPanel({
 				>
 					<FiEdit2 />
 				</button>
-				{removeWorktreeButton(key, worktree)}
 				{(() => {
 					// Idle: two-step confirm then dismiss (the active one too — the
 					// server switches away first). Streaming: two-step force-dismiss
@@ -370,7 +318,7 @@ export const LeftPanel = memo(function LeftPanel({
 		);
 	};
 
-	const renderSessionRow = (s: SessionSummary, worktree?: WorktreeSummary) => {
+	const renderSessionRow = (s: SessionSummary) => {
 		const active = currentFile === s.path;
 		const pending = pendingTarget === s.path && !active;
 		const key = `sess:${s.path}`;
@@ -387,7 +335,6 @@ export const LeftPanel = memo(function LeftPanel({
 					}}
 				>
 					<span className="session-info">
-						{renaming === s.path ? null : branchBadge(worktree)}
 						{renaming === s.path ? (
 							<input
 								autoFocus
@@ -438,7 +385,6 @@ export const LeftPanel = memo(function LeftPanel({
 				>
 					<FiEdit2 />
 				</button>
-				{removeWorktreeButton(key, worktree)}
 				{delButton(key, t("deleteSession"), t("deleteSessionConfirm"), () =>
 					panelSend({ type: "delete_session", path: s.path }),
 				)}
@@ -455,7 +401,7 @@ export const LeftPanel = memo(function LeftPanel({
 			<div className="lp-brand">
 				<span className="lp-brand-title">
 					<Logo size={20} />
-					<span className="lp-brand-name">Dispatch</span>
+					<span className="lp-brand-name">LearningHarness</span>
 				</span>
 				<span className="lp-brand-actions">
 					<button
@@ -541,24 +487,6 @@ export const LeftPanel = memo(function LeftPanel({
 										<span className="lp-group-label">{g.label}</span>
 										{count > 0 && <span className="lp-group-count">{count}</span>}
 									</button>
-									{g.worktrees.length > 0 && (
-										<button
-											type="button"
-											className="lp-del lp-project-new lp-project-worktree"
-											title={t("newWorktreeChat")}
-											aria-label={`${t("newWorktreeChat")} — ${g.label}`}
-											onClick={() => {
-												setCollapsedGroups((prev) => {
-													const next = new Set(prev);
-													next.delete(g.path);
-													return next;
-												});
-												panelSend({ type: "worktree_add", cwd: g.path });
-											}}
-										>
-											<FiGitBranch />
-										</button>
-									)}
 									<button
 										type="button"
 										className="lp-del lp-project-new"
@@ -584,10 +512,10 @@ export const LeftPanel = memo(function LeftPanel({
 									<div className="lp-group-body">
 										{g.conversations.length > 0 && (
 											<div className="lp-group-convs">
-												{g.conversations.map(({ c, depth, worktree }) => renderConversationRow(c, depth, worktree))}
+												{g.conversations.map(({ c, depth }) => renderConversationRow(c, depth))}
 											</div>
 										)}
-										{g.sessions.map((s) => renderSessionRow(s, g.sessionWorktrees.get(cwdKey(s.path))))}
+										{g.sessions.map((s) => renderSessionRow(s))}
 									</div>
 								)}
 								{!collapsed && g.isCurrent && g.conversations.length === 0 && g.sessions.length === 0 && (

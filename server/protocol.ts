@@ -194,9 +194,6 @@ export interface UiState {
 	 *  null / 缺省 = 当前对话没有待答提问。
 	 */
 	pendingQuestion?: UiPendingQuestion | null;
-	/** Delegated workers of this conversation (PiAstra `delegate` tool), live
-	 *  and saved, in start order. Empty when the extension is not loaded. */
-	workers: UiWorker[];
 	tools: string[];
 	/** Monotonic snapshot sequence — clients can use it to drop stale snapshots. */
 	version: number;
@@ -384,14 +381,6 @@ export type ClientMessage =
 	 *  and is idle. Server re-triggers one LLM turn without adding a new user
 	 *  message; refused while streaming. */
 	| { type: "retry_last" }
-	// -- background tasks (AI-started servers) ------------------------------
-	/** Kill ONE background server the agent started (by listening port). */
-	| { type: "kill_background_server"; port?: number }
-	/** Kill EVERY background server the agent started (frees all ports). */
-	| { type: "kill_background_servers" }
-	/** Re-push the current background-server list (the server also refreshes it
-	 *  on its own and prunes entries whose process exited). */
-	| { type: "list_bg_servers" }
 	/** Global-search recursive filename match across the active workspace.
 	 *  Server-side bounded walk; reqId echoes back in search_files_result. */
 	| { type: "search_files"; reqId: number; query: string }
@@ -399,16 +388,6 @@ export type ClientMessage =
 	 *  persisted session transcripts — every user AND assistant message,
 	 *  AI output included. reqId echoes back in session_search_results. */
 	| { type: "search_sessions"; reqId: number; query: string }
-	// -- source-control panel (read-only git queries, server-side execFile) --
-	/** SCM refresh payload: status + branches + numstat (history loads
-	 *  lazily via scm_history so big repos don't pay for it every refresh). */
-	| { type: "scm_status"; reqId: number }
-	/** Commit graph for the history tab (lazy-loaded). */
-	| { type: "scm_history"; reqId: number }
-	/** Staged + worktree diffs for one file. */
-	| { type: "scm_filediff"; reqId: number; path: string }
-	/** Full patch of one commit. */
-	| { type: "scm_commit"; reqId: number; hash: string }
 	| { type: "new_chat"; cwd?: string | null }
 	/** Edit a past user question and re-ask it (forks a new session at that point). */
 	| {
@@ -585,17 +564,6 @@ export type ClientMessage =
 	/** Drop one workspace from this client's recent-project list (UI state
 	 *  only — nothing on disk is touched). */
 	| { type: "remove_project"; path: string }
-	/** Check `branch` out as a linked worktree of the repository containing
-	 *  `cwd` (any checkout of it; omitted = the active cwd) under
-	 *  `~/.pi/worktrees/<repo>/<slug>`, then open a blank chat there — the
-	 *  same fresh-session-in-the-worktree the CLI's `/worktree add` does. An
-	 *  existing checkout of the branch is reused. `branch` omitted = a
-	 *  generated name. Answered with worktree_result. */
-	| { type: "worktree_add"; cwd?: string; branch?: string }
-	/** Remove a linked worktree directory (its branch is kept). Refused while
-	 *  an open conversation runs in it. Without `force`, a worktree with
-	 *  uncommitted changes answers worktree_result{dirty:true} instead. */
-	| { type: "worktree_remove"; path: string; force?: boolean }
 	/** Permanently delete a persisted session transcript file (history list). */
 	| { type: "delete_session"; path: string }
 	/** Append a session_info name entry to a persisted session transcript (history rename). */
@@ -607,14 +575,7 @@ export type ClientMessage =
 	 *  conversations can be dismissed; streaming ones refuse with a notice.
 	 *  force = abort a running conversation before dismissing it. The active
 	 *  conversation may be dismissed too (the server switches away first). */
-	| { type: "dismiss_conversation"; id: string; force?: boolean }
-	// -- delegated workers (right workspace Workers pane) ---------------------
-	/** Follow one worker's transcript: the server answers with worker_transcript
-	 *  now and keeps pushing updates while the worker runs. */
-	| { type: "open_worker"; workerId: number }
-	| { type: "close_worker"; workerId: number }
-	/** Abort ONE running worker; its siblings and the delegate call continue. */
-	| { type: "cancel_worker"; workerId: number };
+	| { type: "dismiss_conversation"; id: string; force?: boolean };
 
 // ---------------------------------------------------------------------------
 // Server -> Client
@@ -649,34 +610,10 @@ export interface SessionSearchResult extends SessionSummary {
  * <dataDir>/client-state.json, merged with cwds found in the session store).
  */
 export interface ProjectSummary {
-	/** Absolute path of the workspace directory. For a git repository this is
-	 *  the MAIN checkout: linked worktrees of the same repository are listed in
-	 *  `worktrees`, never as projects of their own. */
+	/** Absolute path of the workspace directory. */
 	path: string;
-	/** Last time this workspace was used (ms epoch) — drives the sort order.
-	 *  For a repository, the newest across all of its checkouts. */
+	/** Last time this workspace was used (ms epoch) — drives the sort order. */
 	lastUsed: number;
-	/** Every checkout of the repository, main first. Chats and sessions whose
-	 *  cwd is one of these paths belong to this project; non-main entries get
-	 *  a branch badge. Omitted for non-git directories. */
-	worktrees?: WorktreeSummary[];
-}
-
-/** One checkout of a project's repository (see ProjectSummary.worktrees). */
-export interface WorktreeSummary {
-	/** Absolute checkout path (the cwd chats in it run under). */
-	path: string;
-	/** Checked-out branch; null when detached. */
-	branch: string | null;
-	/** Short HEAD hash — the label for a detached checkout. */
-	head: string;
-	/** The repository's main checkout (== ProjectSummary.path). */
-	isMain: boolean;
-	/** Locked by `git worktree lock` (or by a running agent). */
-	locked: boolean;
-	/** Lives under the managed `~/.pi/worktrees/<repo>/<slug>` layout the
-	 *  CLI's /worktree command and this UI create. */
-	managed: boolean;
 }
 
 /** 一个可选项：模型的 ask_user_question 问卷选项。preview 为选项被选中后
@@ -719,26 +656,6 @@ export interface UiPendingQuestion {
 	deadline?: number;
 }
 
-/** A background server the agent left running (listening-port diff around a
- *  bash tool run). Keyed by port. Managed from the 后台任务 panel: each entry
- *  can be stopped individually or all at once, and the list persists even
- *  after the conversation that started them ends. */
-export interface BgServer {
-	/** Port the server listens on (the stable key). */
-	port: number;
-	/** Process id of the listening process. */
-	pid?: number;
-	/** When the server/task was first detected or registered (ms epoch). */
-	since: number;
-	/** Best-effort process name (tasklist / ps), undefined when unknown. */
-	name?: string;
-	/** Best-effort full command line (PowerShell CIM / ps -o command=) so the
-	 *  panel can show WHAT is actually running, undefined when unknown. */
-	command?: string;
-	/** 插件任务的活动状态文案（如轮询间隔、连接数），可经 update 刷新。 */
-	status?: string;
-}
-
 /** One filename match from the global-search recursive workspace walk. */
 export interface FileSearchResult {
 	/** Workspace-relative path ("/"-separated). */
@@ -757,76 +674,6 @@ export interface FileEntry {
 	 * never previewed — the UI doesn't open them and read_file refuses them.
 	 */
 	kind?: "image" | "video" | "text" | "none";
-}
-
-// -- delegated workers -------------------------------------------------------
-
-/** Lifecycle of a delegated worker, as reported by the PiAstra extension.
- *  `interrupted` = restored from a saved session where it never finished. */
-export type UiWorkerStatus = "starting" | "running" | "completed" | "failed" | "cancelled" | "interrupted";
-
-/** One delegated worker (PiAstra `delegate` tool). Mirrors the extension's
- *  public summary on the `piastra:workers` event channel. */
-export interface UiWorker {
-	/** Session-unique worker number (1-based, in start order). */
-	id: number;
-	/** The delegate tool call that started it (groups workers per card). */
-	toolCallId?: string;
-	role: string;
-	model: string;
-	task: string;
-	status: UiWorkerStatus;
-	/** One-line current activity ("→ read src/app.ts", "Thinking…", an error). */
-	activity: string;
-	started: number;
-	ended?: number;
-	/** Bounded recent tool lines kept by the extension (card preview). */
-	recent: string[];
-	/** Tail of the latest assistant text (card preview). */
-	text: string;
-	/** A transcript can be shown: the worker session is live in memory or its
-	 *  saved JSONL is readable. */
-	hasTranscript: boolean;
-}
-
-/** One worker's conversation, in the same shape as the main chat so the
- *  pane renders it with the ordinary message components. */
-export interface UiWorkerTranscript {
-	workerId: number;
-	messages: UiMessage[];
-	/** In-flight assistant message while the worker streams. */
-	streamingMessage: UiMessage | null;
-	/** Where the messages came from; "none" = nothing readable (yet). */
-	source: "live" | "file" | "none";
-}
-
-// -- source-control panel (wire shapes shared by scm_data) -------------------
-
-export interface ScmFileEntry {
-	/** Repo-relative path. */
-	path: string;
-	/** porcelain index (staged) status letter. */
-	x: string;
-	/** porcelain worktree status letter. */
-	y: string;
-}
-
-export interface ScmBranchEntry {
-	name: string;
-	current: boolean;
-	/** Remote name for remote-tracking refs ("origin/main" → "origin"). */
-	remote?: string | boolean;
-}
-
-export interface ScmCommitEntry {
-	hash: string;
-	shortHash: string;
-	author: string;
-	date: string;
-	subject: string;
-	decorations: string;
-	/** The graph prefix emitted by `git log --graph` (for example `| * `). */
-	graph: string;
 }
 
 export interface ModelInfo {
@@ -1002,6 +849,14 @@ export interface UiSettingsState {
 	/** 大模型 API 出错自动重试次数（默认 6；0 = 失败即停）。 */
 	retryMaxAttempts: number;
 }
+/** Versioned Phase-0 demo learn event (shape-compatible with the original spike).
+ *  Runtime guard/channel live in server/learn-events.ts — this module is types-only. */
+export interface LearnEvent {
+	version: 1;
+	type: "demo";
+	message: string;
+}
+
 export type ServerMessage =
 	| {
 			type: "ready";
@@ -1106,15 +961,8 @@ export type ServerMessage =
 	 *  and on request (get_commands). */
 	| { type: "slash_commands"; commands: SlashCommandInfo[] }
 	| { type: "notice"; level: "info" | "warning" | "error"; text: string; textEn?: string }
-	/** The watched git dir changed outside the panel (terminal commit,
-	 *  CLI, IDE) — the client should re-run its scm_status query. */
-	| { type: "scm_changed" }
 	/** Sent every ~10s so clients can detect half-open connections. */
 	| { type: "heartbeat" }
-	/** A followed worker's transcript (reply to open_worker, then pushed on
-	 *  change while the worker runs). Whole-list replace; worker transcripts
-	 *  are bounded, so no delta chain is needed. */
-	| { type: "worker_transcript"; conversationId: string; transcript: UiWorkerTranscript }
 	/** Persisted session list for ONE project. `cwd` is the queried project
 	 *  directory (echoed back from `list_sessions`, or the active cwd on a
 	 *  spontaneous push); the client keys its per-project cache by this field.
@@ -1141,18 +989,6 @@ export type ServerMessage =
 			results: SessionSearchResult[];
 	  }
 	| { type: "projects"; projects: ProjectSummary[] }
-	/** Outcome of worktree_add / worktree_remove. */
-	| {
-			type: "worktree_result";
-			op: "add" | "remove";
-			ok: boolean;
-			/** Checkout path (the created/reused one for add; the target for remove). */
-			path: string;
-			branch?: string;
-			/** remove only: refused because of uncommitted changes — retry with force. */
-			dirty?: boolean;
-			error?: string;
-	  }
 	| {
 			type: "files";
 			path: string;
@@ -1234,33 +1070,6 @@ export type ServerMessage =
 	  }
 	/** Result of an install_pi_agent run (npm i -g finished or failed). */
 	| { type: "install_result"; ok: boolean; detail: string }
-	// -- source-control panel results (see scm_status / scm_filediff / scm_commit) --
-	| {
-			type: "scm_data";
-			reqId: number;
-			kind: "status" | "history" | "filediff" | "commit";
-			ok: boolean;
-			error?: string;
-			/** status payload — fields optional so one wire type carries every
-			 *  kind; the client reads the ones matching `kind`. */
-			notRepo?: boolean;
-			branch?: string;
-			detached?: boolean;
-			upstream?: string | null;
-			ahead?: number;
-			behind?: number;
-			upstreamGone?: boolean;
-			files?: ScmFileEntry[];
-			branches?: ScmBranchEntry[];
-			stats?: Record<string, [number, number]>;
-			history?: ScmCommitEntry[];
-			/** filediff payload */
-			stagedText?: string;
-			worktreeText?: string;
-			untracked?: boolean;
-			/** commit payload */
-			text?: string;
-	  }
 	| {
 			type: "path_completions";
 			completions: { name: string; path: string; type: "dir" | "file" }[];
@@ -1303,10 +1112,5 @@ export type ServerMessage =
 			projectName: string;
 			sessionName?: string;
 	  }
-	// -- background tasks ---------------------------------------------------
-	/** The background-server list (servers the agent left running, detected via
-	 *  listening-port diffs around bash tool runs). Per CLIENT, not per
-	 *  conversation — the list survives conversation switches/ends and only
-	 *  empties when the tasks are stopped (individually or all at once) or the
-	 *  process exits on its own. Pushed on change, on attach and on request. */
-	| { type: "bg_servers"; servers: BgServer[] };
+	/** Validated `learn:demo` engine event, forwarded fire-and-forget per run. */
+	| { type: "learn_event"; conversationId: string; event: LearnEvent };

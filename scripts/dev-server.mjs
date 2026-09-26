@@ -1,12 +1,10 @@
-// Dev backend launcher: derives PI_WEB_PORT / PI_WEB_ALLOW_ORIGINS from the
-// same env vars web/vite.config.ts reads, so `DISPATCH_DEV_PORT=5174
-// PI_WEB_PORT=8789 npm run dev` runs a second checkout beside the default one.
+// Dev backend launcher: LEARN_PORT selects the isolated backend port;
+// DISPATCH_DEV_PORT selects Vite's port (default 5173). E.g. `LEARN_PORT=8789
+// DISPATCH_DEV_PORT=5174 npm run dev` runs beside a default instance.
 //
-// Restarts via `tsx watch` rather than `node --watch`: on Windows volumes
-// with last-access updates enabled, libuv reports a file READ (e.g. git
-// re-reading a modified source file during the SCM refresh) as a change,
-// which threw node's watcher into a restart loop. chokidar (tsx) ignores
-// atime-only events.
+// Use tsx watch rather than node --watch: on Windows volumes with last-access
+// updates enabled, libuv may treat file reads as changes and restart repeatedly.
+// chokidar (tsx) ignores atime-only events.
 import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { learnServerEnv } from "./learn-env.mjs";

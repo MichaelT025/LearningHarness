@@ -40,8 +40,6 @@ import { isManaged, managedRefusal } from "./managed.js";
 import { launchOrigin, toServiceInfo } from "./launch-origin.js";
 import { parseTabs, tabsRefusal } from "./tabs.js";
 import type { ClientMessage, ServerMessage } from "./protocol.js";
-import { registerSubscriptionRoutes } from "./subscriptions-http.js";
-import { subscriptionUsage } from "./subscriptions.js";
 
 /** 从 CLI 参数中取 flag 值：支持 --flag value 与 --flag=value 两种写法。
  *  让 `node dist/server/index.js --host 0.0.0.0 --port 9000` 这类直接启动也能生效，
@@ -103,10 +101,9 @@ function appVersion(): string {
 	}
 	return appVersionCache;
 }
-// Root of the SDK default per-project session dirs — chat transcripts live in
-// <SESSION_DIR_ROOT>/--<cwd>--/, shared with the pi CLI/TUI (getAgentDir
-// honors PI_CODING_AGENT_DIR).
-const SESSION_DIR_ROOT = join(getAgentDir(), "sessions");
+// Explicit session root writes flat transcripts. Otherwise the SDK defaults
+// to per-cwd directories inside the pi agent directory.
+const SESSION_DIR_ROOT = process.env.PI_CODING_AGENT_SESSION_DIR || join(getAgentDir(), "sessions");
 
 // Windows 轻量 bash 兜底：把 <home>/.pi-web/bin 前置到 PATH（SDK 的 bash 工具经
 // findBashOnPath 会找到其中的 bash.exe），并在无 Git Bash 时后台下载 busybox-w32。
@@ -209,7 +206,6 @@ app.get("/api/health", (_req, res) => {
 	res.json({ ok: true, piVersion: VERSION, cwd: CWD, pid: process.pid });
 });
 
-registerSubscriptionRoutes(app, (clientId) => service.get(clientId), originAllowed);
 
 /**
  * Stream a workspace file over HTTP.
@@ -672,26 +668,8 @@ wss.on("connection", (ws) => {
 			case "abort_bash":
 				void cs.abortBash();
 				break;
-			case "open_worker":
-				void cs.openWorker(msg.workerId);
-				break;
-			case "close_worker":
-				cs.closeWorker(msg.workerId);
-				break;
-			case "cancel_worker":
-				cs.cancelWorker(msg.workerId);
-				break;
 			case "retry_last":
 				void cs.retryLast();
-				break;
-			case "kill_background_server":
-				void cs.killBackgroundServer(msg.port);
-				break;
-			case "kill_background_servers":
-				void cs.killAllBackgroundServers();
-				break;
-			case "list_bg_servers":
-				void cs.listBgServers();
 				break;
 			case "pick_project_folder":
 				void pickProjectFolder(cs.cwd)
@@ -735,12 +713,6 @@ wss.on("connection", (ws) => {
 			case "remove_project":
 				void cs.removeProject(msg.path);
 				break;
-			case "worktree_add":
-				void cs.addWorktree(msg.cwd, msg.branch);
-				break;
-			case "worktree_remove":
-				void cs.removeWorktree(msg.path, msg.force);
-				break;
 			case "delete_session":
 				void cs.deleteSession(msg.path);
 				break;
@@ -767,18 +739,6 @@ wss.on("connection", (ws) => {
 				break;
 			case "search_sessions":
 				void cs.searchSessions(msg.query, msg.reqId);
-				break;
-			case "scm_status":
-				void cs.scmQuery("status", msg.reqId);
-				break;
-			case "scm_history":
-				void cs.scmQuery("history", msg.reqId);
-				break;
-			case "scm_filediff":
-				void cs.scmQuery("filediff", msg.reqId, { path: msg.path });
-				break;
-			case "scm_commit":
-				void cs.scmQuery("commit", msg.reqId, { hash: msg.hash });
 				break;
 			case "read_file":
 				void cs.readFile(msg.path);
@@ -1050,7 +1010,7 @@ if (process.env[RESTART_CHILD_ENV] === "1") {
 
 httpServer.listen(PORT, HOST, () => {
 	console.log("");
-	console.log("  ⚡ Dispatch Web — web chat for the pi coding agent");
+	console.log("  ◇ LearningHarness — local chat for learning");
 	console.log(`    http://localhost:${PORT}`);
 	console.log(`    workspace   : ${CWD}`);
 	console.log(`    session dir : ${SESSION_DIR_ROOT}`);
@@ -1072,7 +1032,6 @@ async function shutdown(): Promise<void> {
 	shuttingDown = true;
 	console.log("\nshutting down…");
 	clearInterval(heartbeatTimer);
-	subscriptionUsage.dispose();
 	stopControl();
 	await service.disposeAll();
 	wss.close();

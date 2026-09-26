@@ -1,9 +1,9 @@
 /**
- * pi-web-ui — Progressive Web App service worker.
+ * LearningHarness — Progressive Web App service worker.
  *
  * Strategy overview
  * -----------------
- * pi-web-ui is a WebSocket-first app that needs a live backend, so we do NOT
+ * LearningHarness is a WebSocket-first app that needs a live backend, so we do NOT
  * try to make it fully offline. Instead the SW focuses on what makes it a
  * reliable *installable* PWA on mobile/desktop:
  *
@@ -24,8 +24,8 @@
 
 // Refresh unversioned manifest/notification icons as well as the favicon.
 // Only replace the disposable asset cache; sessions and preferences are untouched.
-const STATIC_CACHE = "pi-web-ui-static-dispatch-logo-2";
-const SHELL_CACHE = "pi-web-ui-shell-v1";
+const STATIC_CACHE = "learning-harness-static-v1";
+const SHELL_CACHE = "learning-harness-shell-v1";
 
 // App root within this origin — "/" for root deployments, "/pi/" behind an
 // nginx sub-path reverse proxy. All path checks below are relative to it, so

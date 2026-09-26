@@ -32,7 +32,7 @@ import { appSend } from "../app-globals";
 import { DEFAULT_PROMPT_TEMPLATE, PROMPT_TOKENS, isReadonlyPromptSource } from "../../../server/prompt-composer.js";
 import { ASK_USER_QUESTION_TOOL_NAME, TERMINAL_TOOL_NAMES } from "../../../server/tool-manager.js";
 
-/** Minimal terminal-tab bridge (same shape SCMPanel uses). */
+/** Minimal terminal-tab bridge for running maintenance commands. */
 interface SettingsTerminalBridge {
 	create: (meta: {
 		id: string;
@@ -279,7 +279,7 @@ export function SettingsModal({ chat, terminal, onSwitchToTerminal, onClose }: S
 	};
 
 	/** Run a maintenance command (extension uninstall) in a VISIBLE terminal
-	 *  tab (same reuse pattern as SCM write ops) so the user sees exactly what
+	 *  tab so the user sees exactly what
 	 *  happened. On exit the App watcher sends extensions_reload. */
 	const runTerminalCommand = (title: string, command: string) => {
 		const cmd: CommandDef = {
