@@ -191,6 +191,21 @@ describe("chatReducer: optimistic new chat", () => {
 	});
 });
 
+describe("chatReducer: topics", () => {
+	it("stores the server topics push", () => {
+		const base = initialChatState();
+		expect(base.topics).toEqual([]);
+		const topics = [
+			{ id: "t1", title: "Algebra", goal: "Learn x", createdAt: 1, cwd: "/topics/algebra" },
+		];
+		const s = chatReducer(base, { type: "topics", topics });
+		expect(s.topics).toEqual(topics);
+		// Replacing, not merging: a removed topic disappears from the sidebar.
+		const s2 = chatReducer(s, { type: "topics", topics: [] });
+		expect(s2.topics).toEqual([]);
+	});
+});
+
 describe("chatReducer: snapshot cache + instant switch", () => {
 	it("caches every displayed snapshot and delta, pruned by the conversation list", () => {
 		let s = shown("c1");

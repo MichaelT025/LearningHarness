@@ -2,7 +2,7 @@
 
 **Learn at your pace, not the pace of the slowest student.**
 
-LearningHarness is a personal, local learning environment in development. Today it provides a pi-powered chat shell; the teaching workflow described below is the goal, **not yet implemented**. Eventually you'll tell it what you want to learn and what you already know. It will map the subject, skip what you've already got, and teach the rest one step at a time. You'll decide how deep to go.
+LearningHarness is a personal, local learning environment in development. Today it provides a pi-powered chat shell with persistent topics and separate chat histories; the teaching workflow described below is the goal, **not yet implemented**. Eventually you'll tell it what you want to learn and what you already know. It will map the subject, skip what you've already got, and teach the rest one step at a time. You'll decide how deep to go.
 
 The longer-term idea is NotebookLM with a model of *you*: what you know, where you've struggled, and how you like things explained. Building that model across subjects comes later.
 
@@ -66,10 +66,10 @@ npm ci
 npm run dev
 ```
 
-Open `http://localhost:5173`. The local backend listens on `127.0.0.1:8788` and Vite proxies `/ws` to it. Set `LEARN_PORT` to change the backend port (Vite follows it), `LEARN_CWD` to choose the initial working directory, or `LEARN_DATA_DIR` for LearningHarness state (default `~/.learning-harness`, with pi session files under `sessions/`). The backend binds loopback only. The launcher ignores any unrelated Dispatch instance's `PI_WEB_*` port/token/workspace settings. Pi credentials still come from its agent directory (`PI_CODING_AGENT_DIR` or pi's normal default). If npm 10 reports a peer-resolution error, try `npm ci --legacy-peer-deps`.
+Open `http://localhost:5173`. The local backend listens on `127.0.0.1:8788` and Vite proxies `/ws` to it. Set `LEARN_PORT` to change the backend port (Vite follows it), `LEARN_CWD` to choose the initial working directory, or `LEARN_DATA_DIR` for LearningHarness state (default `~/.learning-harness`). Chats outside topics keep their existing pi session files under `sessions/`; each new topic lives under `topics/<id>/` with its own `topic.json`, `workspace/`, and `sessions/`. The backend binds loopback only. The launcher ignores any unrelated Dispatch instance's `PI_WEB_*` port/token/workspace settings. Pi credentials still come from its agent directory (`PI_CODING_AGENT_DIR` or pi's normal default). If npm 10 reports a peer-resolution error, try `npm ci --legacy-peer-deps`.
 
 For a production build: `npm run build && npm start`, then open `http://127.0.0.1:8788`. Run `npm run typecheck`, `npm run check:protocol`, and `npm test` for the project checks.
 
-**What works now:** pi-powered streamed chat with persistent pi sessions, model/auth administration, tool cards, files/search, terminals and Markdown/math. The versioned `learn:demo` event is a visible proof of the pi-events → WebSocket → browser path, **not** stored learning data. Coding-specific SCM, worktree, worker, background-server and subscription screens/APIs are excluded. Topic persistence, knowledge graphs, teaching workflows, source curation, and the learner profile in [`docs/plan.md`](docs/plan.md) are future work—not available yet.
+**What works now:** pi-powered streamed chat with persistent pi sessions, model/auth administration, tool cards, files/search, terminals and Markdown/math. Use **New Topic** in the sidebar to give a subject a title and optional goal; selecting it resumes its latest chat after a restart, and its chat history stays separate from other topics. Existing workspace chats remain accessible as before. A topic's goal is stored metadata, not yet an instruction to the tutor. The versioned `learn:demo` event proves the pi-events → WebSocket → browser path, **not** stored learning data. Coding-specific SCM, worktree, worker, background-server and subscription screens/APIs are excluded. Knowledge graphs, teaching workflows, source curation, and the learner profile in [`docs/plan.md`](docs/plan.md) are future work—not available yet.
 
 This app began as a fork of [Dispatch-WebUI](https://github.com/MichaelT025/DispatchWeb) at `8dc1df5`. Its MIT attribution is retained in [`LICENSE`](LICENSE).

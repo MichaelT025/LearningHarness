@@ -710,6 +710,15 @@ wss.on("connection", (ws) => {
 			case "list_projects":
 				void cs.pushProjects();
 				break;
+			case "list_topics":
+				void cs.listTopics();
+				break;
+			case "create_topic":
+				void cs.createTopic(msg.title, msg.goal);
+				break;
+			case "select_topic":
+				void cs.selectTopic(msg.id);
+				break;
 			case "remove_project":
 				void cs.removeProject(msg.path);
 				break;

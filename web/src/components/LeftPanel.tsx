@@ -11,12 +11,13 @@ import {
 	FiTrash2,
 	FiX,
 } from "react-icons/fi";
-import type { ConversationSummary, ProjectSummary, SessionSummary } from "../types";
+import type { ConversationSummary, ProjectSummary, SessionSummary, TopicSummary } from "../types";
 import { useT } from "../i18n";
 import { Logo } from "./Logo";
 import { useAppField } from "../app-globals";
 import {
 	buildLeftNav,
+	newChatCwd,
 	pendingSessionCwds,
 	stableProjectOrder,
 	type NavGroup,
@@ -34,12 +35,17 @@ interface LeftPanelProps {
 	/** Persisted sessions per project cwd (server echoes the queried cwd). */
 	sessionsByCwd: Map<string, SessionSummary[]>;
 	projects: ProjectSummary[];
+	/** Learning topics (sidebar groups backed by topic workspaces). */
+	topics: TopicSummary[];
 	activeConversationId: string;
 	panelSend: (
 		msg:
 			| { type: "new_chat"; cwd?: string | null }
 			| { type: "list_sessions"; cwd?: string }
 			| { type: "list_projects" }
+			| { type: "list_topics" }
+			| { type: "create_topic"; title: string; goal?: string }
+			| { type: "select_topic"; id: string }
 			| { type: "pick_project_folder" }
 			| { type: "switch_session"; path: string }
 			| { type: "switch_conversation"; id: string }
@@ -93,6 +99,7 @@ export const LeftPanel = memo(function LeftPanel({
 	conversations,
 	sessionsByCwd,
 	projects,
+	topics,
 	activeConversationId,
 	panelSend,
 	active,
@@ -132,7 +139,26 @@ export const LeftPanel = memo(function LeftPanel({
 		if (!cwd) return;
 		panelSend({ type: "list_sessions" });
 		panelSend({ type: "list_projects" });
+		panelSend({ type: "list_topics" });
 	}, [active, ready, status, cwd, panelSend]);
+	/** Inline New Topic form (title + optional goal); validates nonempty title. */
+	const [topicFormOpen, setTopicFormOpen] = useState(false);
+	const [topicTitle, setTopicTitle] = useState("");
+	const [topicGoal, setTopicGoal] = useState("");
+	const [topicError, setTopicError] = useState<string | null>(null);
+	const submitTopic = useCallback(() => {
+		const title = topicTitle.trim();
+		if (!title) {
+			setTopicError("Title is required");
+			return;
+		}
+		setTopicError(null);
+		const goal = topicGoal.trim();
+		if (!panelSend(goal ? { type: "create_topic", title, goal } : { type: "create_topic", title })) return;
+		setTopicTitle("");
+		setTopicGoal("");
+		setTopicFormOpen(false);
+	}, [topicTitle, topicGoal, panelSend]);
 
 	/** 已成功拉到过会话列表的项目 cwd 以 sessionsByCwd 为准（服务器只在收到
 	 *  list_sessions 后回推带 cwd 的 sessions）。in-flight 只是防抖标记，回执到达
@@ -158,8 +184,12 @@ export const LeftPanel = memo(function LeftPanel({
 
 	const projectOrder = useRef<string[]>([]);
 	const navGroups = useMemo(
-		() => stableProjectOrder(buildLeftNav(projects, conversations, sessionsByCwd, currentCwd), projectOrder.current),
-		[projects, conversations, sessionsByCwd, currentCwd],
+		() =>
+				stableProjectOrder(
+					buildLeftNav(projects, conversations, sessionsByCwd, currentCwd, topics),
+					projectOrder.current,
+				),
+		[projects, conversations, sessionsByCwd, currentCwd, topics],
 	);
 	/** Row the user just clicked, highlighted before the server finishes the
 	 *  switch (opening a chat in another project boots a fresh runtime, which
@@ -429,11 +459,63 @@ export const LeftPanel = memo(function LeftPanel({
 				type="button"
 				className="lp-new-chat"
 				title={t("newChatTip")}
-				onClick={() => panelSend({ type: "new_chat", cwd: null })}
+				onClick={() => panelSend({ type: "new_chat", cwd: newChatCwd(currentCwd, topics) })}
 			>
 				<FiEdit2 />
 				<span>{t("newChat")}</span>
 			</button>
+			{!topicFormOpen ? (
+				<button
+					type="button"
+					className="lp-new-topic"
+					title="New learning topic"
+					disabled={!ready}
+					onClick={() => {
+						setTopicError(null);
+						setTopicFormOpen(true);
+					}}
+				>
+					<FiPlus />
+					<span>New Topic</span>
+				</button>
+			) : (
+				<div className="lp-topic-form">
+					<input
+						autoFocus
+						className="lp-topic-input"
+						placeholder="Topic title (required)"
+						value={topicTitle}
+						onChange={(e) => setTopicTitle(e.target.value)}
+						onKeyDown={(e) => {
+							if (e.key === "Enter" && !e.nativeEvent.isComposing) submitTopic();
+							else if (e.key === "Escape") setTopicFormOpen(false);
+						}}
+					/>
+					<input
+						className="lp-topic-input"
+						placeholder="Goal (optional)"
+						value={topicGoal}
+						onChange={(e) => setTopicGoal(e.target.value)}
+						onKeyDown={(e) => {
+							if (e.key === "Enter" && !e.nativeEvent.isComposing) submitTopic();
+							else if (e.key === "Escape") setTopicFormOpen(false);
+						}}
+					/>
+					{topicError && <div className="lp-topic-error">{topicError}</div>}
+					<div className="lp-topic-actions">
+						<button type="button" className="lp-topic-create" disabled={!ready} onClick={submitTopic}>
+							Create
+						</button>
+						<button
+							type="button"
+							className="lp-topic-cancel"
+							onClick={() => setTopicFormOpen(false)}
+						>
+							Cancel
+						</button>
+					</div>
+				</div>
+			)}
 			<div className="lp-section-label">
 				<span>{t("recentProjects")}</span>
 				<button
@@ -478,9 +560,15 @@ export const LeftPanel = memo(function LeftPanel({
 									<button
 										type="button"
 										className={`lp-group-main${g.isCurrent ? " active" : ""}`}
-										title={g.path}
+										title={g.topic && g.topic.goal ? g.topic.goal : g.path}
 										onClick={() => {
-											if (!g.isCurrent) panelSend({ type: "set_cwd", path: g.path });
+											if (g.isCurrent) return;
+											// Topic groups select via select_topic (the server drives
+											// the set_cwd/snapshot pipeline); legacy groups use set_cwd.
+											// Never optimistically relabel: the view only changes on
+											// the server's snapshot push.
+											if (g.topic) panelSend({ type: "select_topic", id: g.topic.id });
+											else panelSend({ type: "set_cwd", path: g.path });
 										}}
 									>
 										<FiFolder className="lp-group-icon" />
@@ -503,7 +591,7 @@ export const LeftPanel = memo(function LeftPanel({
 									>
 										<FiEdit2 />
 									</button>
-									{g.isProject &&
+									{g.isProject && !g.topic &&
 										delButton(`proj:${g.path}`, t("deleteProject"), t("deleteProjectConfirm"), () =>
 											panelSend({ type: "remove_project", path: g.path }),
 										)}

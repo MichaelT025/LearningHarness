@@ -416,6 +416,9 @@ export type ClientMessage =
 	| { type: "switch_session"; path: string }
 	| { type: "switch_conversation"; id: string }
 	| { type: "list_projects" }
+	| { type: "list_topics" }
+	| { type: "create_topic"; title: string; goal?: string }
+	| { type: "select_topic"; id: string }
 	/** Open the host OS folder picker; cancellation leaves the project unchanged. */
 	| { type: "pick_project_folder" }
 	| { type: "list_files"; path?: string }
@@ -614,6 +617,15 @@ export interface ProjectSummary {
 	path: string;
 	/** Last time this workspace was used (ms epoch) — drives the sort order. */
 	lastUsed: number;
+}
+
+/** Persisted learning topic. Its cwd is a private workspace under the data root. */
+export interface TopicSummary {
+	id: string;
+	title: string;
+	goal: string;
+	createdAt: number;
+	cwd: string;
 }
 
 /** 一个可选项：模型的 ask_user_question 问卷选项。preview 为选项被选中后
@@ -989,6 +1001,7 @@ export type ServerMessage =
 			results: SessionSearchResult[];
 	  }
 	| { type: "projects"; projects: ProjectSummary[] }
+	| { type: "topics"; topics: TopicSummary[] }
 	| {
 			type: "files";
 			path: string;

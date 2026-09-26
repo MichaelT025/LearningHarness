@@ -19,6 +19,7 @@ import type {
 	SessionSearchResult,
 	SessionSummary,
 	SlashCommandInfo,
+	TopicSummary,
 	ToolStatus,
 	TerminalInfo,
 	UiModelConfigEntry,
@@ -95,6 +96,8 @@ export interface ChatState {
 	activeConversationId: string;
 	/** Recent workspaces this client opened (left panel project picker). */
 	projects: ProjectSummary[];
+	/** Learning topics known to the server (sidebar groups). */
+	topics: TopicSummary[];
 	/** Workspace file listing for the right panel. */
 	files: FileListing | null;
 	/** Latest file content fetched for the preview panel (path-matched in the modal). */
@@ -230,6 +233,7 @@ export type ChatAction =
 			activeId: string;
 	  }
 	| { type: "projects"; projects: ProjectSummary[] }
+	| { type: "topics"; topics: TopicSummary[] }
 	| { type: "files"; files: FileListing }
 	| { type: "file_changed"; path: string }
 	| { type: "file_content"; content: FileContent }
@@ -620,6 +624,8 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 			};
 		case "projects":
 			return { ...state, projects: action.projects };
+		case "topics":
+			return { ...state, topics: action.topics };
 		case "files":
 			return { ...state, files: action.files };
 		case "file_changed":
@@ -798,6 +804,7 @@ export function initialChatState(): ChatState {
 		conversations: [],
 		activeConversationId: "",
 		projects: [],
+		topics: [],
 		files: null,
 
 		fileChanged: null,
@@ -1124,6 +1131,9 @@ export function useChat() {
 					break;
 				case "projects":
 					dispatch({ type: "projects", projects: msg.projects });
+					break;
+				case "topics":
+					dispatch({ type: "topics", topics: msg.topics });
 					break;
 				case "files":
 					dispatch({ type: "files", files: msg });

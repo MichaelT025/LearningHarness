@@ -5,12 +5,30 @@
  * Kept side-effect free so the grouping/nesting/order rules can be unit-tested
  * without a DOM. The component only renders whatever this returns.
  */
-import type { ConversationSummary, ProjectSummary, SessionSummary } from "../types";
+import type { ConversationSummary, ProjectSummary, SessionSummary, TopicSummary } from "../types";
+
+/**
+ * Cwd for the top New Chat button: when the active cwd is a topic workspace,
+ * stay in the topic's private session root; otherwise null (projectless
+ * behavior preserved). Matched with cwdKey so Windows case variants agree.
+ */
+export function newChatCwd(currentCwd: string, topics: readonly TopicSummary[] = []): string | null {
+	if (!currentCwd) return null;
+	const key = cwdKey(currentCwd);
+	return topics.some((t) => cwdKey(t.cwd) === key) ? currentCwd : null;
+}
 
 /** A running conversation row (depth kept for the nested-row layout). */
 export interface NavConversation {
 	c: ConversationSummary;
 	depth: number;
+}
+
+/** Topic backing a group, when its cwd matches a known learning topic. */
+export interface NavTopic {
+	id: string;
+	title: string;
+	goal: string;
 }
 
 /** One top-level navigation group (a workspace directory). */
@@ -33,6 +51,8 @@ export interface NavGroup {
 	 *  cwd (whose listing arrives through the unscoped `list_sessions`).
 	 *  Flat groups track exactly one cwd, so this is either [path] or []. */
 	fetchCwds: string[];
+	/** Learning topic backing this group, if its cwd is a topic workspace. */
+	topic?: NavTopic;
 }
 
 /** Directory basename, tolerant of trailing and mixed separators. */
@@ -65,20 +85,24 @@ function makeGroup(
 	convsByKey: Map<string, ConversationSummary[]>,
 	sessionsByKey: ReadonlyMap<string, SessionSummary[]>,
 	currentCwd: string,
+	topicsByKey?: ReadonlyMap<string, TopicSummary>,
 ): NavGroup {
 	const currentKey = cwdKey(currentCwd);
 	const key = cwdKey(path);
 	const conversations = (convsByKey.get(key) ?? []).map((c) => ({ c, depth: 0 }));
 	const sessions = [...(sessionsByKey.get(key) ?? [])].sort((a, b) => b.modified - a.modified);
+	const topic = topicsByKey?.get(key);
 	return {
 		path,
-		label: basename(path),
+		// A topic workspace shows its human-readable title, never the raw path.
+		label: topic && topic.title.trim() ? topic.title : basename(path),
 		isProject,
 		isCurrent: key === currentKey,
 		lastUsed,
 		conversations,
 		sessions,
 		fetchCwds: key === currentKey ? [] : [path],
+		...(topic ? { topic: { id: topic.id, title: topic.title, goal: topic.goal ?? "" } } : {}),
 	};
 }
 
@@ -146,6 +170,7 @@ export function buildLeftNav(
 	conversations: ConversationSummary[],
 	sessionsByCwd: ReadonlyMap<string, SessionSummary[]>,
 	currentCwd: string,
+	topics: readonly TopicSummary[] = [],
 ): NavGroup[] {
 	// Everything is matched by folded key so case variants of one directory
 	// land in one group; the group keeps the first spelling it saw.
@@ -189,19 +214,38 @@ export function buildLeftNav(
 		}
 	}
 
+	const topicsByKey = new Map<string, TopicSummary>();
+	for (const t of topics) {
+		const key = cwdKey(t.cwd);
+		if (!topicsByKey.has(key)) topicsByKey.set(key, t);
+	}
+	// Topic workspaces are first-class groups even with no sessions and no
+	// per-client project history: merge their cwds into the project inputs
+	// BEFORE the existing algorithm runs, skipping cwds already listed so a
+	// topic that is also a recent project never appears twice.
+	const effectiveProjects: ProjectSummary[] =
+		topicsByKey.size === 0
+			? projects
+			: [
+					...projects,
+					...[...topicsByKey.values()]
+						.filter((t) => ![...projects].some((p) => cwdKey(p.path) === cwdKey(t.cwd)))
+						.map((t) => ({ path: t.cwd, lastUsed: t.createdAt })),
+				];
+
 	const known = new Set<string>();
 	const groups: NavGroup[] = [];
 
-	for (const p of projects) {
+	for (const p of effectiveProjects) {
 		known.add(cwdKey(p.path));
-		groups.push(makeGroup(p.path, true, p.lastUsed, convsByKey, sessionsByKey, currentCwd));
+		groups.push(makeGroup(p.path, true, p.lastUsed, convsByKey, sessionsByKey, currentCwd, topicsByKey));
 	}
 
 	const ungroupedKeys = [...new Set([...convsByKey.keys(), ...sessionsByKey.keys()])]
 		.filter((key) => !known.has(key))
 		.sort();
 	for (const key of ungroupedKeys) {
-		groups.push(makeGroup(spelling.get(key) ?? key, false, 0, convsByKey, sessionsByKey, currentCwd));
+		groups.push(makeGroup(spelling.get(key) ?? key, false, 0, convsByKey, sessionsByKey, currentCwd, topicsByKey));
 	}
 
 	groups.sort((a, b) => {

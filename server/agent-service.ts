@@ -103,6 +103,7 @@ import {
 	type SerializeCache,
 } from "./session-preview.js";
 import { makeInputRequiredNotification, NotificationLifecycle } from "./notification-lifecycle.js";
+import { TopicStore } from "./topics.js";
 
 const SNAPSHOT_INTERVAL_MS = 60;
 /** While assistant deltas are flowing, live rendering is carried by
@@ -627,6 +628,8 @@ export class ClientSession {
 	private readonly agentDir: string;
 	/** Persisted per-client UI state (last workspace + recent projects). */
 	private readonly stateStore: ClientStateStore;
+	/** Learning topics — one shared store per server (owned by AgentService). */
+	private readonly topicStore: TopicStore;
 	/** Open conversations — each owns its OWN runtime, so starting a new chat
 	 *  or switching chats never interrupts an in-flight run. `runtime` and
 	 *  `session` accessors below target the ACTIVE conversation. */
@@ -1022,11 +1025,18 @@ export class ClientSession {
 		{ resolve: (value: QuestionAnswer[] | null) => void; questions: UiQuestion[]; conversationId?: string }
 	>();
 
-	private constructor(clientId: string, cwd: string, agentDir: string, stateStore: ClientStateStore) {
+	private constructor(
+		clientId: string,
+		cwd: string,
+		agentDir: string,
+		stateStore: ClientStateStore,
+		topicStore: TopicStore,
+	) {
 		this.clientId = clientId;
 		this.cwd = cwd;
 		this.agentDir = agentDir;
 		this.stateStore = stateStore;
+		this.topicStore = topicStore;
 		this.settingsSvc = new SettingsService({
 			clientId,
 			stateStore,
@@ -1064,10 +1074,15 @@ export class ClientSession {
 		});
 	}
 
-	static async create(clientId: string, cwd: string, stateStore: ClientStateStore): Promise<ClientSession> {
+	static async create(
+		clientId: string,
+		cwd: string,
+		stateStore: ClientStateStore,
+		topicStore: TopicStore,
+	): Promise<ClientSession> {
 		const agentDir = process.env.PI_CODING_AGENT_DIR ?? getAgentDir();
 
-		const cs = new ClientSession(clientId, cwd, agentDir, stateStore);
+		const cs = new ClientSession(clientId, cwd, agentDir, stateStore, topicStore);
 		const conversationId = cs.nextConversationId();
 		const terminals = cs.makeTerminalManager(conversationId, cwd);
 		const runtime = await createAgentSessionRuntime(cs.makeRuntimeFactory(terminals, conversationId), {
@@ -1075,7 +1090,7 @@ export class ClientSession {
 			agentDir,
 			// Resume this project's most recent session (from the configured flat
 			// session root, or pi's per-project default when unset); otherwise start fresh.
-			sessionManager: SessionManager.continueRecent(cwd, piSessionsRoot()),
+			sessionManager: SessionManager.continueRecent(cwd, cs.sessionRootFor(cwd)),
 		});
 		// First conversation = the resumed session; it also seeds the shared
 		// ModelRuntime that every later conversation reuses.
@@ -1354,6 +1369,10 @@ export class ClientSession {
 		// Reconnect: push the built-in provider key list (multi-key grouping in the
 		// model picker needs it even before the client asks).
 		this.modelAdmin.listProviderKeys();
+		// Reconnect: push the learning-topic list (same as list_topics).
+		void this.pushTopics().catch(() => {
+			// best effort — a failed push must not break attach
+		});
 		// PTYs are conversation-owned and survive a socket reconnect.
 		this.pushTerminals();
 	}
@@ -3095,7 +3114,7 @@ export class ClientSession {
 			const runtime = await createAgentSessionRuntime(this.makeRuntimeFactory(conv.terminals, conv.id), {
 				cwd: conv.cwd,
 				agentDir: this.agentDir,
-				sessionManager: SessionManager.continueRecent(conv.cwd, piSessionsRoot()),
+				sessionManager: SessionManager.continueRecent(conv.cwd, this.sessionRootFor(conv.cwd)),
 			});
 			conv.runtime = runtime;
 			conv.session = runtime.session;
@@ -3214,7 +3233,7 @@ export class ClientSession {
 			const runtime = await createAgentSessionRuntime(this.makeRuntimeFactory(terminals, conversationId), {
 				cwd: this.cwd,
 				agentDir: this.agentDir,
-				sessionManager: SessionManager.create(this.cwd, piSessionsRoot()),
+				sessionManager: SessionManager.create(this.cwd, this.sessionRootFor(this.cwd)),
 			});
 			const conv = this.makeConversation(runtime, conversationId, terminals);
 			this.convs.set(conv.id, conv);
@@ -3278,7 +3297,7 @@ export class ClientSession {
 			const runtime = await createAgentSessionRuntime(this.makeRuntimeFactory(terminals, conversationId), {
 				cwd: abs,
 				agentDir: this.agentDir,
-				sessionManager: SessionManager.create(abs, piSessionsRoot()),
+				sessionManager: SessionManager.create(abs, this.sessionRootFor(abs)),
 			});
 			await this.activateFreshConversation(this.makeConversation(runtime, conversationId, terminals), displaced);
 		} catch (err) {
@@ -3466,13 +3485,25 @@ export class ClientSession {
 	/** How many non-project directories get their sessions pushed for "Recents". */
 	private static readonly RECENT_CWD_CAP = 12;
 
+	/** Session-dir override for one cwd: a known topic's private session dir
+	 *  wins, otherwise the configured flat root (or the SDK default when
+	 *  unset). Every SessionManager.create/continueRecent/list(cwd) call goes
+	 *  through here so topic workspaces resolve to their own transcripts. */
+	private sessionRootFor(cwd: string): string | undefined {
+		try {
+			return this.topicStore.sessionDirForCwd(cwd) ?? piSessionsRoot();
+		} catch {
+			return piSessionsRoot();
+		}
+	}
+
 	private async loadSessionInfos(cwd: string = this.cwd): Promise<SessionInfo[]> {
 		const now = Date.now();
 		const c = this.sessionInfosCache.get(cwd);
 		if (c && now - c.at < ClientSession.SESSION_INFO_CACHE_TTL) {
 			return c.infos;
 		}
-		const infos = await SessionManager.list(cwd, piSessionsRoot());
+		const infos = await SessionManager.list(cwd, this.sessionRootFor(cwd));
 		this.sessionInfosCache.set(cwd, { infos, at: now });
 		return infos;
 	}
@@ -3532,6 +3563,148 @@ export class ClientSession {
 		this.emit({ type: "sessions", cwd: this.canonicalize(path), sessions: [] });
 	}
 
+	// -----------------------------------------------------------------------
+	// Learning topics (server/topics.ts TopicStore — one shared instance owned
+	// by AgentService). A topic owns a private workspace cwd; selecting a topic
+	// goes through the existing setCwd() so all project-switch semantics stay
+	// identical. Every public method catches its own failures so `void`
+	// dispatch in index.ts can never produce an unhandled rejection.
+	//
+	// Navigation (creation + setCwd) is additionally serialized through
+	// topicNavQueue below: concurrent select_topic/create_topic requests would
+	// otherwise race setCwd, so repeated fast selects could open the same
+	// transcript in two runtimes or finish out of order.
+	// -----------------------------------------------------------------------
+
+	/** FIFO tail serializing topic create/select navigations. Duplicate
+	 *  in-flight requests are queued in arrival order (never run
+	 *  concurrently), so the last request executes last and wins. Legacy
+	 *  set_cwd is untouched and stays unserialized. */
+	private topicNavQueue: Promise<void> = Promise.resolve();
+
+	/** Append navigation work to the FIFO tail. The chain survives failures:
+	 *  work reports its own errors via notice, and the trailing catch keeps
+	 *  both the stored tail and the returned promise resolved, so one bad
+	 *  request can neither stall the queue nor surface an unhandled rejection
+	 *  to the `void` dispatch in index.ts. */
+	private enqueueTopicNav(work: () => Promise<void>): Promise<void> {
+		const tail = this.topicNavQueue.then(work, work);
+		this.topicNavQueue = tail.then(
+			() => undefined,
+			() => undefined,
+		);
+		return this.topicNavQueue;
+	}
+
+	/** Push the current topic list to the client (attach + explicit request). */
+	private async pushTopics(): Promise<void> {
+		const topics = await this.topicStore.list();
+		this.emit({
+			type: "topics",
+			topics: topics.map((t) => ({
+				id: t.id,
+				title: t.title,
+				goal: t.goal ?? "",
+				createdAt: t.createdAt,
+				cwd: t.cwd,
+			})),
+		});
+	}
+
+	/** Explicit client request (list_topics) — pushTopics on demand. */
+	async listTopics(): Promise<void> {
+		try {
+			await this.pushTopics();
+		} catch (err) {
+			this.emit({
+				type: "notice",
+				level: "error",
+				text: `Failed to list topics: ${(err as Error).message}`,
+			});
+		}
+	}
+
+	/** Create a topic, then switch into its workspace via the existing setCwd().
+	 *  Queued behind other in-flight topic navigations (see topicNavQueue). */
+	async createTopic(title: string, goal?: string): Promise<void> {
+		return this.enqueueTopicNav(async () => {
+			try {
+				const trimmed = (title ?? "").trim();
+				if (!trimmed) {
+					this.emit({ type: "notice", level: "error", text: "Topic title is required" });
+					return;
+				}
+				const topic = await this.topicStore.create(trimmed, goal);
+				await this.pushTopics();
+				if (topic?.cwd) await this.setCwd(topic.cwd);
+			} catch (err) {
+				this.emit({
+					type: "notice",
+					level: "error",
+					text: `Failed to create topic: ${(err as Error).message}`,
+				});
+			}
+		});
+	}
+
+	/** Select a topic by id — emit the list, then switch via setCwd().
+	 *  Queued behind other in-flight topic navigations (see topicNavQueue). */
+	async selectTopic(id: string): Promise<void> {
+		return this.enqueueTopicNav(async () => {
+			try {
+				if (!(id ?? "").trim()) {
+					this.emit({ type: "notice", level: "error", text: "Unknown topic" });
+					return;
+				}
+				const topic = await this.topicStore.get(id);
+				if (!topic) {
+					this.emit({ type: "notice", level: "error", text: `Unknown topic: ${id}` });
+					return;
+				}
+				await this.pushTopics();
+				await this.setCwd(topic.cwd);
+			} catch (err) {
+				this.emit({
+					type: "notice",
+					level: "error",
+					text: `Failed to select topic: ${(err as Error).message}`,
+				});
+			}
+		});
+	}
+
+	/** Session dirs owned by known topics (resolved absolute paths). Best-effort:
+	 *  an unreadable store just yields no extra roots. */
+	private async topicSessionRoots(): Promise<Set<string>> {
+		const roots = new Set<string>();
+		try {
+			for (const t of await this.topicStore.list()) {
+				try {
+					const d = this.topicStore.sessionDirForCwd(t.cwd);
+					if (typeof d === "string" && d) roots.add(resolve(d));
+				} catch {
+					// ignore one bad topic mapping
+				}
+			}
+		} catch {
+			// store unreadable — fall back to the configured root only
+		}
+		return roots;
+	}
+
+	/** Guardrail for transcript mutation: the configured sessions root (or the
+	 *  SDK-default fallback — unchanged general behavior) plus exactly-known
+	 *  topic session roots. Anything else is rejected, so unrelated files can
+	 *  never be renamed or deleted through the history panel. */
+	private async isAllowedSessionFile(abs: string): Promise<boolean> {
+		const fallbackRoot = resolve(piSessionsRoot() ?? resolve(this.agentDir, "sessions"));
+		if (abs.startsWith(fallbackRoot + sep)) return true;
+		for (const r of await this.topicSessionRoots()) {
+			if (abs === r || abs.startsWith(r + sep)) return true;
+		}
+		return false;
+	}
+
 	/** Permanently delete a persisted session transcript file (history list ✕).
 	 *
 	 * Deleting the ACTIVE conversation's own transcript is allowed: the session
@@ -3545,10 +3718,11 @@ export class ClientSession {
 	async deleteSession(path: string): Promise<void> {
 		try {
 			const abs = resolve(path);
-			// Guardrail: only transcripts under this app's configured sessions root
-			// may be deleted — never arbitrary files.
-			const sessionsRoot = resolve(piSessionsRoot() ?? resolve(this.agentDir, "sessions"));
-			if (!abs.startsWith(sessionsRoot + sep)) {
+			// Guardrail: only transcripts under the configured sessions root
+			// (or the SDK-default fallback) or inside an exactly-known topic
+			// session root may be deleted — never arbitrary files. Topic-root
+			// membership is checked against the live topic store.
+			if (!(await this.isAllowedSessionFile(abs))) {
 				this.emit({
 					type: "notice",
 					level: "error",
@@ -3576,7 +3750,7 @@ export class ClientSession {
 			}
 			if (holder) {
 				// Same source the history panel uses (refreshSessions): newest first.
-				const infos = await SessionManager.list(this.cwd, piSessionsRoot());
+				const infos = await SessionManager.list(this.cwd, this.sessionRootFor(this.cwd));
 				const next = infos
 					.filter((s) => resolve(s.path) !== abs)
 					.sort((a, b) => b.modified.getTime() - a.modified.getTime())[0];
@@ -3642,8 +3816,9 @@ export class ClientSession {
 			const trimmed = (name ?? "").trim();
 			if (!trimmed) return;
 			const abs = resolve(path);
-			const sessionsRoot = resolve(piSessionsRoot() ?? resolve(this.agentDir, "sessions"));
-			if (!abs.startsWith(sessionsRoot + sep)) {
+			// Same guardrail as deleteSession: configured root (or SDK-default
+			// fallback) plus exactly-known topic session roots.
+			if (!(await this.isAllowedSessionFile(abs))) {
 				this.emit({
 					type: "notice",
 					level: "error",
@@ -4097,17 +4272,10 @@ export class ClientSession {
 	}
 
 	/**
-	 * Push the project list. A directory is a project when this client opened
-	 * it explicitly (picker / set_cwd / launch cwd) OR it is a git repository
-	 * root that has sessions — a repo you only ever ran the pi CLI in is still
-	 * a project. A linked git worktree is never a project of its own: it is
-	 * folded into its repository's MAIN checkout and listed in that project's
-	 * `worktrees`, so chats run in `~/.pi/worktrees/<repo>/<branch>` sit under
-	 * `<repo>` with a branch badge instead of forming a look-alike sibling.
-	 * Anything else with sessions (a shell's default cwd like system32 or
-	 * $HOME, the projectless chats dir, deleted workspaces) is not promoted;
-	 * those listings are pushed right after so the sidebar can show them flat
-	 * under "Recents".
+	 * Push workspace groups. Include directories this client opened explicitly,
+	 * repositories with sessions, and every known learning topic (including
+	 * topics with no chat yet). Other directories with session history remain
+	 * detached recent chats rather than becoming workspace groups.
 	 */
 	async pushProjects(): Promise<void> {
 		try {
@@ -4153,12 +4321,29 @@ export class ClientSession {
 			const bump = (g: Group, t: number) => {
 				if (t > g.lastUsed) g.lastUsed = t;
 			};
+			// Learning topics always surface, even before their first session
+			// lands in default-root history (their session dirs may live
+			// outside the scanned root). latestByKey falls back to the topic's
+			// creation time so fresh topics still sort; topicKeys forces the
+			// project-group promotion below without a repo root or saved entry.
+			const topicKeys = new Set<string>();
+			try {
+				for (const t of await this.topicStore.list()) {
+					const key = cwdKey(spelling(t.cwd));
+					topicKeys.add(key);
+					const prev = latestByKey.get(key);
+					const stamp = typeof t.createdAt === "number" ? t.createdAt : Date.now();
+					if (prev === undefined || stamp > prev) latestByKey.set(key, stamp);
+				}
+			} catch {
+				// store unreadable — session history alone still lists
+			}
 			const candidates = new Set<string>([...savedLastUsed.keys(), ...latestByKey.keys()]);
 			for (const key of candidates) {
 				const path = canonical.get(key) ?? key;
 				if (path === this.projectlessCwd) continue;
 				const t = Math.max(savedLastUsed.get(key) ?? 0, latestByKey.get(key) ?? 0);
-				if (isRepoRoot(path) || savedLastUsed.has(key)) {
+				if (isRepoRoot(path) || savedLastUsed.has(key) || topicKeys.has(key)) {
 					let g = groups.get(key);
 					if (!g) {
 						g = { path, lastUsed: 0 };
@@ -4410,7 +4595,7 @@ export class ClientSession {
 				const newRuntime = await createAgentSessionRuntime(this.makeRuntimeFactory(terminals, conversationId), {
 					cwd: abs,
 					agentDir: this.agentDir,
-					sessionManager: SessionManager.continueRecent(abs, piSessionsRoot()),
+					sessionManager: SessionManager.continueRecent(abs, this.sessionRootFor(abs)),
 				});
 				await this.activateFreshConversation(this.makeConversation(newRuntime, conversationId, terminals), displaced);
 			}
@@ -4596,6 +4781,9 @@ export class AgentService {
 	private socketCount = 0;
 	private pending = new Map<string, Promise<ClientSession>>();
 	private stateStore: ClientStateStore;
+	/** Learning topics — one shared store, rooted at the same data dir as
+	 *  per-client UI state (dirname of the state file). */
+	private readonly topicStore: TopicStore;
 	/** Set by index.ts: called when /pi-web-ui:quit is invoked. */
 	onQuit: (() => boolean) | undefined = undefined;
 	/** 任意客户端成功切换工作区后触发（新绝对路径）。index.ts 接到
@@ -4607,6 +4795,7 @@ export class AgentService {
 		stateFile: string,
 	) {
 		this.stateStore = new ClientStateStore(stateFile);
+		this.topicStore = new TopicStore(dirname(stateFile));
 	}
 
 	/** Get or create the session for a client, racing attach calls safely. */
@@ -4707,7 +4896,7 @@ export class AgentService {
 					}
 				}
 				// Sessions use the SDK default per-project dir — no per-client dir.
-				const creating = ClientSession.create(clientId, cwd, this.stateStore).finally(() => {
+				const creating = ClientSession.create(clientId, cwd, this.stateStore, this.topicStore).finally(() => {
 					this.pending.delete(clientId);
 				});
 				this.pending.set(clientId, creating);

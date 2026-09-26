@@ -826,6 +826,7 @@ export function App() {
 						conversations={chat.conversations}
 						sessionsByCwd={chat.sessionsByCwd}
 						projects={chat.projects}
+						topics={chat.topics}
 						activeConversationId={chat.activeConversationId}
 					/>
 				</div>
