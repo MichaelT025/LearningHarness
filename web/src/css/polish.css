@@ -1,0 +1,297 @@
+/* PiAstra polish — cross-cutting chrome shared by every surface: menus,
+   modals, buttons, inputs, scrollbars, focus rings. Loaded last so equal-
+   specificity selectors win by source order; no !important. Only tokens, no
+   literal colors, so downloadable themes keep working. */
+
+/* ---- text rendering ---- */
+.app,
+.modal-backdrop,
+.gs-backdrop {
+	-webkit-font-smoothing: antialiased;
+	-moz-osx-font-smoothing: grayscale;
+	text-rendering: optimizeLegibility;
+}
+/* form controls don't inherit the page face by default */
+button,
+input,
+select,
+textarea {
+	font-family: inherit;
+}
+code,
+kbd,
+pre,
+samp,
+textarea.mono {
+	font-family: var(--mono);
+	font-feature-settings: "calt" 1;
+}
+
+/* ---- one focus ring for everything keyboard-reachable ---- */
+.app button:focus-visible,
+.app [role="button"]:focus-visible,
+.app a:focus-visible,
+.modal button:focus-visible,
+.gs-modal button:focus-visible {
+	outline: 0;
+	box-shadow: var(--ring);
+}
+.app input:focus-visible,
+.app select:focus-visible,
+.app textarea:focus-visible,
+.modal input:focus-visible,
+.modal select:focus-visible,
+.modal textarea:focus-visible {
+	outline: 0;
+}
+
+/* ---- scrollbars: hairline thumb that only shows on hover ---- */
+* {
+	scrollbar-width: thin;
+	scrollbar-color: var(--scroll-thumb) transparent;
+}
+::-webkit-scrollbar {
+	width: 8px;
+	height: 8px;
+}
+::-webkit-scrollbar-thumb {
+	background: var(--scroll-thumb);
+	border-radius: 8px;
+	border: 2px solid transparent;
+	background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+	background: var(--scroll-thumb-hover);
+	background-clip: padding-box;
+}
+
+/* ---- dropdown menus (model / thinking / header menus) ---- */
+.dd-menu {
+	border: 1px solid var(--border);
+	border-radius: var(--radius-md, 10px);
+	background: var(--menu-bg, var(--bg-elev2));
+	box-shadow: var(--shadow-menu);
+	padding: 6px;
+}
+.dd-item {
+	padding: 8px 10px;
+	border-radius: var(--radius-sm, 6px);
+	font-size: 14px;
+	color: var(--text-dim);
+	transition:
+		background 0.1s,
+		color 0.1s;
+}
+.dd-item:hover {
+	background: var(--bg-elev2);
+	color: var(--text);
+}
+.dd-item.active {
+	color: var(--text);
+}
+.dd-menu-model .dd-model-item,
+.dd-menu-model .dd-provider {
+	border-radius: var(--radius-sm, 6px);
+}
+
+/* ---- generic chips / buttons: quieter borders, consistent radius ---- */
+.chip {
+	border-color: var(--border-soft);
+	border-radius: var(--radius-sm, 6px);
+	font-size: 13.5px;
+}
+.chip:hover {
+	border-color: var(--border);
+	background: var(--bg-elev2);
+}
+.btn {
+	border-color: var(--border);
+	border-radius: var(--radius-sm, 6px);
+	font-size: 14px;
+	font-weight: 500;
+	background: var(--bg-elev2);
+	color: var(--text);
+	transition:
+		background 0.12s,
+		border-color 0.12s,
+		color 0.12s;
+}
+.btn:hover:not(:disabled) {
+	background: var(--bg-elev3);
+	border-color: var(--border);
+}
+.btn.primary {
+	background: var(--send-blue);
+	border-color: var(--send-blue);
+	color: var(--send-fg);
+}
+.btn.primary:hover:not(:disabled) {
+	filter: none;
+	background: var(--send-blue-hover);
+	border-color: var(--send-blue-hover);
+}
+.scroll-bottom {
+	padding: 7px 14px;
+	border-color: var(--border);
+	background: var(--menu-bg, var(--bg-elev2));
+	color: var(--text);
+	font-size: 13.5px;
+	font-weight: 500;
+	box-shadow: var(--shadow-menu);
+}
+.scroll-bottom:hover {
+	border-color: var(--text-faint);
+	color: var(--text);
+}
+
+/* ---- text inputs ---- */
+.set-input,
+.field input,
+.field select,
+.field textarea {
+	background: var(--bg);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm, 6px);
+	font-size: 14px;
+	transition:
+		border-color 0.12s,
+		box-shadow 0.12s;
+}
+.set-input:focus,
+.field input:focus,
+.field select:focus,
+.field textarea:focus {
+	border-color: var(--text-faint);
+	box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.set-save-btn {
+	border-color: var(--border);
+	border-radius: var(--radius-sm, 6px);
+	color: var(--text);
+}
+
+/* ---- modals ---- */
+.modal-backdrop {
+	background: rgba(0, 0, 0, 0.6);
+	backdrop-filter: blur(6px);
+}
+.modal {
+	gap: 16px;
+	background: var(--bg-elev);
+	border: 1px solid var(--border);
+	border-radius: var(--radius-lg, 14px);
+	box-shadow: var(--shadow-modal);
+	padding: 8px;
+}
+.modal-head h2 {
+	font-size: 17px;
+	font-weight: 600;
+	letter-spacing: 0;
+}
+.modal-head-icon {
+	color: var(--text-dim);
+}
+.modal-desc {
+	font-size: 14px;
+}
+.modal-close {
+	width: 30px;
+	height: 30px;
+	border-radius: var(--radius-sm, 6px);
+}
+.modal-close:hover {
+	background: var(--bg-elev2);
+}
+.settings-modal {
+	max-width: 800px;
+}
+.settings-tab {
+	border-radius: var(--radius-sm, 6px);
+	font-size: 14px;
+	padding: 7px 10px;
+}
+.settings-tab:hover {
+	background: var(--bg-elev2);
+}
+.settings-tab.active {
+	background: var(--bg-elev2);
+	color: var(--text);
+	font-weight: 500;
+}
+.set-section-title {
+	font-weight: 600;
+	letter-spacing: 0;
+}
+.set-catalog-add,
+.set-card,
+.set-preset,
+.set-list-item {
+	border-radius: var(--radius-md, 10px);
+}
+
+/* ---- global search palette ---- */
+.gs-modal {
+	border-color: var(--border);
+	border-radius: var(--radius-lg, 14px);
+	background: var(--bg-elev);
+	box-shadow: var(--shadow-modal);
+}
+.gs-input-row {
+	border-bottom-color: var(--border-soft);
+}
+.gs-input-row input {
+	font-size: 15.5px;
+}
+.gs-item {
+	border-radius: var(--radius-sm, 6px);
+}
+.gs-item:hover:not(:disabled),
+.gs-item.active:not(:disabled) {
+	background: var(--bg-elev2);
+}
+.gs-section-head {
+	font-size: 11.5px;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+}
+
+/* ---- inline question dialogs ---- */
+.dialog-inline {
+	border-color: var(--border-soft);
+	border-radius: var(--radius-lg, 14px);
+	background: var(--card-bg);
+}
+.dialog-option {
+	border-radius: var(--radius-sm, 6px);
+}
+
+/* ---- question rail: quieter ticks ---- */
+.qn-rail {
+	opacity: 0.7;
+	transition: opacity 0.15s;
+}
+.qn-rail:hover {
+	opacity: 1;
+}
+
+/* ---- tooltips ---- */
+.hint-tip,
+.tooltip {
+	border-radius: var(--radius-sm, 6px);
+	font-size: 12.5px;
+	box-shadow: var(--shadow-menu);
+}
+
+/* ---- resize handles: neutral, no accent flash ---- */
+.resize-handle:hover::after,
+body.panel-resizing .resize-handle::after {
+	background: var(--text-faint);
+	opacity: 0.6;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.app *,
+	.modal * {
+		transition-duration: 0.01ms !important;
+	}
+}

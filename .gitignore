@@ -5,3 +5,8 @@ web/dist/
 coverage/
 *.log
 .env
+.pi/
+.pi-web/
+.pi-subagents/
+tests/scratch/
+test-results/

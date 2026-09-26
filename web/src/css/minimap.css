@@ -1,0 +1,115 @@
+/* Hermes-style prompt minimap. The viewport is deliberately narrow and the
+   long track is virtualized by PromptMinimap rather than laid out in full. */
+.qn-rail {
+	position: absolute;
+	top: 50%;
+	bottom: auto;
+	right: 14px;
+	width: 24px;
+	height: auto;
+	display: block;
+	transform: translateY(-50%);
+	z-index: 15;
+	pointer-events: none;
+	opacity: 1;
+	overflow: visible;
+}
+
+.qn-rail::before {
+	display: none;
+}
+
+.qn-rail-viewport {
+	position: relative;
+	width: 100%;
+	max-height: none;
+	overflow-y: auto;
+	overflow-x: hidden;
+	overscroll-behavior: contain;
+	pointer-events: auto;
+	scrollbar-width: none;
+}
+.qn-rail-viewport::-webkit-scrollbar {
+	display: none;
+	width: 0;
+}
+.qn-rail-track {
+	position: relative;
+	width: 100%;
+}
+
+/* Every button owns one complete 24px × 7px row. The pseudo-element is the
+   only visible mark, so neighboring rows can never overlap. */
+.qn-bar {
+	position: absolute;
+	left: 0;
+	display: block;
+	box-sizing: border-box;
+	width: 24px;
+	height: 7px;
+	margin: 0;
+	padding: 0;
+	border: 0;
+	border-radius: 0;
+	background: transparent;
+	cursor: pointer;
+}
+.qn-bar::before {
+	content: "";
+	position: absolute;
+	left: 50%;
+	top: 50%;
+	width: var(--tick-width, 16px);
+	height: 1px;
+	border-radius: 1px;
+	transform: translate(-50%, -50%);
+	background: var(--glow-18);
+	transition:
+		width 0.12s ease,
+		background-color 0.12s ease;
+}
+/* Neutralize the legacy rail's filled button/glow states; only the 1px
+   tick should change, never its invisible hit area. */
+.qn-bar:hover,
+.qn-bar:focus-visible,
+.qn-bar.active {
+	background: transparent;
+	box-shadow: none;
+}
+.qn-bar:hover::before,
+.qn-bar:focus-visible::before {
+	background: var(--text-dim);
+}
+.qn-bar.active::before {
+	background: var(--accent);
+}
+.qn-bar:focus-visible {
+	outline: 1px solid var(--accent);
+	outline-offset: 1px;
+}
+
+.qn-tooltip {
+	position: absolute;
+	right: calc(100% + 8px);
+	width: min(230px, calc(100vw - 48px));
+	max-height: 38px;
+	overflow: hidden;
+	padding: 5px 8px;
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	background: var(--tooltip-bg, var(--bg-elev2));
+	color: var(--text);
+	font-size: 12px;
+	line-height: 1.35;
+	text-align: left;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	pointer-events: none;
+	box-shadow: var(--shadow-menu, 0 5px 18px rgba(0, 0, 0, 0.25));
+}
+
+@media (max-width: 640px) {
+	.qn-rail {
+		display: none;
+	}
+}

@@ -1,130 +1,453 @@
 /**
- * Phase-0 adapted Dispatch-WebUI server chat bridge (spike).
+ * pi-web-ui server entry.
  *
- * - Binds 127.0.0.1, default port 8788 (LEARN_PORT override).
- * - GET /api/health -> { ok, cwd, pid }.
- * - Serves web/dist statically in production when present.
- * - WS /ws carries the protocol in ./protocol.js with same-authority Origin
- *   validation and a frame size limit.
- * - One SDK session per socket (cwd from LEARN_CWD or process.cwd());
- *   dispose on socket close; abort message aborts the run; errors surface
- *   as { type: 'error' } payloads.
+ * - Serves the built frontend (web/dist) in production; in dev, Vite serves it
+ *   on :5173 and proxies /ws to this server.
+ * - Exposes /api/health and a WebSocket endpoint at /ws carrying the chat
+ *   protocol defined in protocol.ts.
  *
- * Deliberately NOT copied from Dispatch-WebUI: AgentService, tabs, terminals,
- * worktrees, subscriptions, model admin, file services (baseline 8dc1df5).
- * SDK baseline: @earendil-works/pi-coding-agent 0.87.1.
+ * Env:
+ *   PI_WEB_PORT     HTTP port (default 8787)
+ *   PI_WEB_CWD      workspace the agent operates in (default: process.cwd())
+ *   PI_WEB_DATA_DIR where per-client UI state is stored (client-state.json,
+ *   default: <home>/.pi-web). Chat sessions are NOT stored here — they live
+ *   in the pi agent's global TUI session dir (~/.pi/agent/sessions/--<cwd>--/)
+ *   via the SDK default, so this web UI, the dev instance, and the pi CLI/TUI
+ *   all share one conversation list per project.
+ *   PI_CODING_AGENT_DIR  pi config dir (auth/models/skills) — passed to the SDK
  */
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { dirname, extname, join, resolve, sep } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { stat } from "node:fs/promises";
+import { createServer, type IncomingMessage } from "node:http";
+import { createConnection } from "node:net";
+import { basename, delimiter, dirname, join, resolve, sep } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { WebSocketServer, WebSocket, type RawData } from "ws";
-import { ChatSession, defaultDeps, type ChatSessionDeps } from "./chat-session.js";
+import { randomUUID } from "node:crypto";
+import express from "express";
+import compression from "compression";
+import { WebSocket, WebSocketServer } from "ws";
+import { VERSION, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { pickProjectFolder } from "./project-folder-picker.js";
+import { PROTOCOL_VERSION } from "./protocol-version.js";
+import { AgentService, workspacePath, QuiesceRejectedError } from "./agent-service.js";
+import { isAbsoluteWirePath, wireToAbs } from "./files-service.js";
+import { previewKind } from "./text-sniff.js";
+import { startControlServer } from "./control-socket.js";
+import { scheduleUploadCleanup } from "./uploads.js";
+import { ensureWindowsBash, windowsBashDir } from "./ensure-bash.js";
+import { isManaged, managedRefusal } from "./managed.js";
+import { launchOrigin, toServiceInfo } from "./launch-origin.js";
+import { parseTabs, tabsRefusal } from "./tabs.js";
 import type { ClientMessage, ServerMessage } from "./protocol.js";
+import { registerSubscriptionRoutes } from "./subscriptions-http.js";
+import { subscriptionUsage } from "./subscriptions.js";
 
-const PORT = Number(process.env.LEARN_PORT ?? 8788);
-const HOST = "127.0.0.1";
-const CWD = resolve(process.env.LEARN_CWD ?? process.cwd());
-/** Max inbound WS frame / prompt text (1 MiB): spike-sized, not Dispatch's 256 MiB. */
-const MAX_TEXT_BYTES = 1_048_576;
+/** 从 CLI 参数中取 flag 值：支持 --flag value 与 --flag=value 两种写法。
+ *  让 `node dist/server/index.js --host 0.0.0.0 --port 9000` 这类直接启动也能生效，
+ *  而不只是经由 bin/pi-web-ui.mjs 的 env 转发。bin 仍是主入口，此处仅作兜底。 */
+function cliFlag(name: string): string | undefined {
+	const eq = `${name}=`;
+	for (let i = 2; i < process.argv.length; i++) {
+		const a = process.argv[i];
+		if (a === name && i + 1 < process.argv.length) return process.argv[i + 1];
+		if (a.startsWith(eq)) return a.slice(eq.length);
+	}
+	return undefined;
+}
 
-const here = dirname(fileURLToPath(import.meta.url));
+const PORT = Number(cliFlag("--port") ?? process.env.PI_WEB_PORT ?? 8787);
+const CWD = resolve(cliFlag("--cwd") ?? process.env.PI_WEB_CWD ?? process.cwd());
+const DATA_DIR = resolve(cliFlag("--data-dir") ?? process.env.PI_WEB_DATA_DIR ?? join(homedir(), ".pi-web"));
+
+/** Bind address. Default is loopback ONLY — the service is a local personal
+ *  tool and should not be reachable from the network unless explicitly asked
+ *  (e.g. PI_WEB_HOST=0.0.0.0 for LAN access / Docker port mapping). */
+const HOST = cliFlag("--host") ?? process.env.PI_WEB_HOST ?? "127.0.0.1";
+/** Optional strict hostname allowlist (comma-separated) — only used when set.
+ *  Origin / Host same-authority matching happens regardless. */
+const ALLOW_HOSTS = (process.env.PI_WEB_ALLOW_HOSTS ?? "")
+	.split(",")
+	.map((s) => s.trim().toLowerCase())
+	.filter(Boolean);
+/** Optional extra Origins allowed through the same-authority check (comma-
+ *  separated, e.g. reverse-proxy setups where the browser origin differs
+ *  from the Host the backend sees). */
+const ALLOW_ORIGINS = (process.env.PI_WEB_ALLOW_ORIGINS ?? "")
+	.split(",")
+	.map((s) => s.trim().toLowerCase())
+	.filter(Boolean);
+/** 可选共享口令（PI_WEB_TOKEN）：设置后所有 HTTP/WS 请求必须携带——
+ *  Authorization: Bearer / X-PI-Token 头、?token= 查询参数或 pi_web_token cookie
+ *  任一匹配即可；供 0.0.0.0 / 反代等暴露场景兜底，未设置则行为不变。 */
+const AUTH_TOKEN = process.env.PI_WEB_TOKEN?.trim() ?? "";
+/**
+ * 本包版本 —— 下载语言包时优先取同版本 tag，保证 key 对齐。
+ *
+ * Read on first use, not here. `resolvePkgRoot()` is hoisted, but it reads
+ * `here`, which is a `const` declared further down: calling it at module-init
+ * time throws on the temporal dead zone, the catch swallows it, and the
+ * version was silently "" — so the language packs never used the version tag
+ * and always fell back to `main`. Reading it lazily costs one branch and
+ * gives the real number.
+ */
+let appVersionCache: string | null = null;
+function appVersion(): string {
+	if (appVersionCache === null) {
+		try {
+			const pkg = JSON.parse(readFileSync(join(resolvePkgRoot(), "package.json"), "utf8")) as { version?: string };
+			appVersionCache = pkg.version ?? "";
+		} catch {
+			appVersionCache = "";
+		}
+	}
+	return appVersionCache;
+}
+// Root of the SDK default per-project session dirs — chat transcripts live in
+// <SESSION_DIR_ROOT>/--<cwd>--/, shared with the pi CLI/TUI (getAgentDir
+// honors PI_CODING_AGENT_DIR).
+const SESSION_DIR_ROOT = join(getAgentDir(), "sessions");
+
+// Windows 轻量 bash 兜底：把 <home>/.pi-web/bin 前置到 PATH（SDK 的 bash 工具经
+// findBashOnPath 会找到其中的 bash.exe），并在无 Git Bash 时后台下载 busybox-w32。
+// 终端面板的 shell 探测链也已包含该目录（见 terminals.ts resolveShell）。
+if (process.platform === "win32") {
+	process.env.PATH = `${windowsBashDir()}${delimiter}${process.env.PATH ?? ""}`;
+	void ensureWindowsBash();
+}
+
+const app = express();
+app.use(express.json({ limit: "10mb" }));
+
+/** 从请求中提取候选 token：头 / 查询参数 / cookie（浏览器导航场景靠 cookie 续命）。 */
+function requestTokens(req: { headers: IncomingMessage["headers"]; url?: string }): string[] {
+	const out: string[] = [];
+	const auth = req.headers.authorization;
+	if (typeof auth === "string" && auth.startsWith("Bearer ")) out.push(auth.slice(7).trim());
+	const header = req.headers["x-pi-token"];
+	if (typeof header === "string") out.push(header.trim());
+	try {
+		const q = new URL(req.url ?? "/", "http://localhost").searchParams.get("token");
+		if (q) out.push(q.trim());
+	} catch {
+		/* ignore malformed url */
+	}
+	const cookie = req.headers.cookie;
+	if (typeof cookie === "string") {
+		for (const part of cookie.split(";")) {
+			const [k, ...rest] = part.trim().split("=");
+			if (k === "pi_web_token") out.push(rest.join("=").trim());
+		}
+	}
+	return out.filter(Boolean);
+}
+
+function tokenOk(req: Parameters<typeof requestTokens>[0]): boolean {
+	return requestTokens(req).includes(AUTH_TOKEN);
+}
+
+/** 请求携带的 pi_web_token cookie 值（未带/损坏时为空串）。 */
+function cookieToken(req: { headers: IncomingMessage["headers"] }): string {
+	const cookie = req.headers.cookie;
+	if (typeof cookie !== "string") return "";
+	for (const part of cookie.split(";")) {
+		const [k, ...rest] = part.trim().split("=");
+		if (k === "pi_web_token") return rest.join("=").trim();
+	}
+	return "";
+}
+
+if (AUTH_TOKEN) {
+	// /api/health 保持开放：无敏感信息，容器/监控探针需要它。
+	// 但绝不能因命中 /api/health 就反射下发真实 token cookie（安全漏洞：issue #45）。
+	app.use((req, res, next) => {
+		const ok = tokenOk(req);
+		const cookie = cookieToken(req);
+		// 浏览器经 ?token= 首次进入后下发 HttpOnly cookie，后续导航/资源请求免带参数。
+		// 重要：只要请求携带着有效 token（query/header/cookie 任一匹配）就把 cookie 刷新为
+		// 当前 AUTH_TOKEN——服务端重启改了 PI_WEB_TOKEN 后，旧 cookie 经一次正确的
+		// ?token= 进入即被重新同步，无需用户清缓存（issue #71）。
+		if (ok) {
+			if (cookie !== encodeURIComponent(AUTH_TOKEN)) {
+				res.setHeader(
+					"Set-Cookie",
+					`pi_web_token=${encodeURIComponent(AUTH_TOKEN)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=31536000`,
+				);
+			}
+		} else if (cookie) {
+			// 请求带的 cookie 已是失效旧值（服务端口令已更换）——立即让其过期，
+			// 避免浏览器被残留 cookie 卡死一年（本来也不该再信任它鉴权）。
+			res.setHeader("Set-Cookie", "pi_web_token=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
+		}
+		if (req.path === "/api/health" || ok) {
+			next();
+			return;
+		}
+		res
+			.status(401)
+			.send(
+				cookie
+					? "unauthorized: PI_WEB_TOKEN required — 服务端口令已变更？已清除旧 token cookie，请用当前 ?token= 重新进入"
+					: "unauthorized: PI_WEB_TOKEN required (?token=…)",
+			);
+	});
+}
+
+/** PI_WEB_MANAGED=1: this instance is updated by whoever deploys it. */
+const MANAGED = isManaged();
+/** Who started this process: a platform service manager (launchd / systemd /
+ *  Windows watchdog — i.e. `pi-web-ui server start|install`) or nothing
+ *  (foreground / dev / Docker). Decides whether the UPDATE panel offers
+ *  "restart service" and what quitting means (see scheduleQuit). */
+const ORIGIN = launchOrigin();
+/** 下发给浏览器的服务信息（null = 没有 supervisor）。 */
+const SERVICE_INFO = toServiceInfo(ORIGIN);
+/** PI_WEB_TABS: the tabs this instance offers. null = all of them, as before. */
+const TABS = parseTabs();
+
+app.get("/api/health", (_req, res) => {
+	res.json({ ok: true, piVersion: VERSION, cwd: CWD, pid: process.pid });
+});
+
+registerSubscriptionRoutes(app, (clientId) => service.get(clientId), originAllowed);
 
 /**
- * Production static root that works in both runtimes:
- * - tsx dev (`server/index.ts`):        <root>/server        -> ../web/dist
- * - compiled start (`dist/server/*.js`): <root>/dist/server   -> ../../web/dist
- * `LEARN_WEB_DIST` overrides; the process-cwd layout is a last fallback.
+ * Stream a workspace file over HTTP.
+ *
+ * Media preview (no download param): only image/video kinds are served —
+ * text goes over the WebSocket, and exe/jar/etc. are never exposed here.
+ * express's sendFile handles Range requests, so video seeking works.
+ *
+ * Download (?download=1): any file kind is served with
+ * Content-Disposition: attachment so the browser saves it instead of
+ * rendering. Path is validated against the workspace root either way.
  */
-export function resolveWebDist(fromDir: string = here): string | null {
-	const candidates = [
-		process.env.LEARN_WEB_DIST,
-		resolve(fromDir, "..", "web", "dist"),
-		resolve(fromDir, "..", "..", "web", "dist"),
-		resolve(process.cwd(), "web", "dist"),
-	];
+app.get("/api/file", async (req, res) => {
+	try {
+		const raw = typeof req.query.path === "string" ? req.query.path : "";
+		// Resolve against the requesting client's workspace (the opened
+		// project), not the server's startup cwd — they can differ when the
+		// client switched projects or restored a previous workspace. Fall
+		// back to the server cwd for requests without a known client.
+		const cid = typeof req.query.clientId === "string" ? req.query.clientId : "";
+		const cs = cid ? service.get(cid) : undefined;
+		const root = cs?.cwd ?? CWD;
+		const absWire = isAbsoluteWirePath(raw);
+		let abs: string;
+		if (absWire) {
+			abs = wireToAbs(raw);
+		} else {
+			const wp = workspacePath(root, raw);
+			if (!wp) {
+				res.status(400).end("path outside workspace");
+				return;
+			}
+			abs = wp.abs;
+		}
+		const name = basename(abs);
+		const kind = previewKind(name);
+		const isDownload = req.query.download === "1";
+		// HTML files preview through a sandboxed <iframe> in the file modal
+		// (FilePreview.tsx). They are text as far as previewKind goes, so
+		// allowlist them explicitly here.
+		const lower = name.toLowerCase();
+		const isHtmlPreview = lower.endsWith(".html") || lower.endsWith(".htm") || lower.endsWith(".xhtml");
+		if (!isDownload && kind !== "image" && kind !== "video" && !isHtmlPreview) {
+			res.status(400).end("not a previewable media file");
+			return;
+		}
+		const st = await stat(abs);
+		if (!st.isFile()) {
+			res.status(400).end("not a file");
+			return;
+		}
+		if (isDownload) {
+			// res.download sets Content-Disposition: attachment and RFC 5987
+			// filename* encoding for non-ASCII names.
+			res.download(abs, name);
+		} else {
+			if (isHtmlPreview) {
+				// Sandbox even a top-level navigation to this URL: a workspace
+				// HTML file must never get our origin (it could otherwise read
+				// the token cookie). The modal iframe carries its own sandbox
+				// attribute as well (defense in depth).
+				//
+				// ?allowJs=1 is the explicit per-file opt-in from the preview
+				// modal ("启用脚本"): scripts run, but still in an opaque
+				// origin — no DOM/cookie/storage access to our app, no forms,
+				// no top-navigation. NEVER add allow-same-origin here.
+				const allowJs = req.query.allowJs === "1";
+				res.setHeader("Content-Security-Policy", allowJs ? "sandbox allow-scripts" : "sandbox");
+				res.setHeader("X-Content-Type-Options", "nosniff");
+			}
+			res.sendFile(abs);
+		}
+	} catch {
+		res.status(404).end("not found");
+	}
+});
+
+/**
+ * Directory-mapped preview: serves a workspace file at a URL that mirrors its
+ * directory location, so an HTML preview's RELATIVE subresources
+ * (<link href="../web/src/styles.css">, <img src="./x.png">, <script
+ * src="./app.js">, …) resolve and load with normal browser semantics. The
+ * iframe document URL itself carries the file's directory — no HTML rewriting.
+ *
+ *   /api/preview/<workspace-rel-path>?clientId=…[&allowJs=1]
+ *   /api/preview/__abs__/<absolute-wire-path>?clientId=…[&allowJs=1]
+ *   (each path segment URI-encoded; ".." is normalized by the browser before
+ *   the request is sent, workspace containment is still re-checked here)
+ *
+ * Same footing as /api/file: workspace containment enforced, HTML documents
+ * get a sandboxed CSP (?allowJs=1 relaxes scripts only — never same-origin),
+ * everything else streams with its real content type.
+ */
+app.get("/api/preview/*", async (req, res) => {
+	try {
+		const captured = String((req.params as unknown as Record<string, string>)[0] ?? "");
+		const ABS_MARKER = "__abs__/";
+		const cid = typeof req.query.clientId === "string" ? req.query.clientId : "";
+		const cs = cid ? service.get(cid) : undefined;
+		const root = cs?.cwd ?? CWD;
+		// Express decodes %XX in the wildcard, so this is back to the wire
+		// form (filenames never contain "/", so per-segment encoding from
+		// the client round-trips exactly).
+		let abs: string;
+		if (captured === "__abs__" || captured.startsWith(ABS_MARKER)) {
+			// Machine browsing: absolute wire path ("C:/..." / "/...").
+			const wire = captured.slice(ABS_MARKER.length);
+			if (!isAbsoluteWirePath(wire)) {
+				res.status(400).end("bad absolute preview path");
+				return;
+			}
+			abs = wireToAbs(wire);
+		} else {
+			const wp = workspacePath(root, captured);
+			if (!wp) {
+				res.status(400).end("path outside workspace");
+				return;
+			}
+			abs = wp.abs;
+		}
+		const name = basename(abs);
+		const st = await stat(abs);
+		if (!st.isFile()) {
+			res.status(400).end("not a file");
+			return;
+		}
+		res.setHeader("X-Content-Type-Options", "nosniff");
+		const lower = name.toLowerCase();
+		if (lower.endsWith(".html") || lower.endsWith(".htm") || lower.endsWith(".xhtml")) {
+			const allowJs = req.query.allowJs === "1";
+			res.setHeader("Content-Security-Policy", allowJs ? "sandbox allow-scripts" : "sandbox");
+		}
+		res.sendFile(abs);
+	} catch {
+		res.status(404).end("not found");
+	}
+});
+
+// Production: serve the built frontend from web/dist. Resolve relative to this
+// module so it works when installed as a package (global/npx/Docker), not just
+// from the repo root. In dev, Vite serves the UI on :5173 and proxies /ws.
+const here = dirname(fileURLToPath(import.meta.url)); // <pkg>/dist/server or <pkg>/server
+// Resolve the package root robustly: dev runs from <repo>/server (tsx), prod
+// from <pkg>/dist/server — the ancestor that actually has package.json wins.
+function resolvePkgRoot(): string {
+	// 可选：显式指定 pkgRoot（如部署在自定义目录时），否则按候选路径探测。
+	if (process.env.PI_WEB_PKG_ROOT) return process.env.PI_WEB_PKG_ROOT;
+	const candidates = [resolve(here, ".."), resolve(here, "..", ".."), resolve(here, "..", "..", "..")];
 	for (const c of candidates) {
-		if (c && existsSync(c)) return resolve(c);
+		if (existsSync(join(c, "package.json"))) return c;
 	}
-	return null;
+	return candidates[0];
 }
-
-/**
- * Map a URL pathname to an absolute file under `webRoot`, or null for 404.
- * - `..` traversal outside the root is rejected.
- * - Missing asset paths (any file extension) and /api/* never get the SPA
- *   fallback — only extensionless routes fall back to index.html.
- */
-export function resolveStaticFile(webRoot: string, pathname: string): string | null {
-	let rel: string;
-	try {
-		rel = decodeURIComponent(pathname).replace(/^\/+/, "");
-	} catch {
-		return null;
-	}
-	const file = resolve(webRoot, rel);
-	if (file !== webRoot && !file.startsWith(webRoot + sep)) return null; // traversal
-	try {
-		const st = statSync(file, { throwIfNoEntry: false });
-		if (st?.isFile()) return file;
-	} catch {
-		return null;
-	}
-	if (pathname.startsWith("/api/")) return null;
-	if (extname(file) !== "") return null; // missing asset -> 404, not index.html
-	const index = join(webRoot, "index.html");
-	return existsSync(index) ? index : null;
-}
-
-const MIME: Record<string, string> = {
-	".html": "text/html; charset=utf-8",
-	".js": "text/javascript; charset=utf-8",
-	".css": "text/css; charset=utf-8",
-	".json": "application/json; charset=utf-8",
-	".svg": "image/svg+xml",
-	".png": "image/png",
-	".ico": "image/x-icon",
-	".webmanifest": "application/manifest+json",
-};
-
-function serveHealth(_req: IncomingMessage, res: ServerResponse): void {
-	res.writeHead(200, { "content-type": "application/json" });
-	res.end(JSON.stringify({ ok: true, cwd: CWD, pid: process.pid }));
-}
-
-function serveStatic(pathname: string, res: ServerResponse): boolean {
-	const webRoot = resolveWebDist();
-	if (!webRoot) return false;
-	const file = resolveStaticFile(webRoot, pathname);
-	if (!file) return false;
-	try {
-		res.writeHead(200, {
-			"content-type": MIME[extname(file)] ?? "application/octet-stream",
+const pkgRoot = resolvePkgRoot();
+/** Set in the env of the replacement child spawned by a self-update restart. */
+const RESTART_CHILD_ENV = "PI_WEB_RESTART_CHILD";
+const webDist = join(pkgRoot, "web", "dist");
+if (existsSync(webDist)) {
+	// gzip/deflate 响应压缩：前端 bundle ~1MB，局域网/反代场景传输量降到 ~1/4；
+	// 对 API JSON 同样生效，WS 升级不受影响
+	app.use(compression());
+	app.use(
+		express.static(webDist, {
+			// Vite 产物文件名带内容 hash，可永久强缓存——业务发版后 hash 变化自然失效，
+			// index.html 由下方 catch-all 处理（sendFile 不走这里）
+			setHeaders(res, filePath) {
+				if (filePath.includes(`${sep}assets${sep}`)) {
+					res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+				}
+			},
+		}),
+	);
+	// 缺失的静态文件必须 404（不能落进下面的 SPA catch-all）：缺少的 hash 产物若
+	// 回 index.html（200），浏览器会把 HTML 当 JS/CSS 执行失败黑屏，SW 还会把
+	// 它按 200 缓进 STATIC_CACHE，之后即使文件恢复也要清缓存才能好。
+	app.use((req, res, next) => {
+		const p = req.path;
+		if (
+			p.startsWith("/assets/") ||
+			p.startsWith("/icons/") ||
+			p === "/favicon.svg" ||
+			p === "/icon.ico" ||
+			p === "/manifest.webmanifest"
+		) {
+			res.status(404).end();
+			return;
+		}
+		next();
+	});
+	app.get(/^\/(?!api\/|ws).*/, (_req, res) => {
+		// Callback form: a failed stat here (npm i -g is mid-replacement of the
+		// package dir) responds 503 instead of crashing the request pipeline
+		// with an unhandled ENOENT stack trace.
+		res.sendFile(join(webDist, "index.html"), (err) => {
+			if (err && !res.headersSent) {
+				res.status(503).send("正在更新 pi-web-ui，请稍后刷新…");
+			}
 		});
-		res.end(readFileSync(file));
-		return true;
-	} catch {
-		return false;
-	}
+	});
+} else if (process.env[RESTART_CHILD_ENV]) {
+	// Auto-restart replacement of a self-update whose npm install did not
+	// complete (Windows: locked files / rollback can leave the global package
+	// without web/dist). Fail loudly with a repair hint instead of serving a
+	// UI-less 404 with no explanation.
+	console.error(
+		"✖ 更新后的安装不完整（缺少 web/dist/index.html）。\n" + "  请手动执行 npm i -g pi-web-ui@latest 修复后重新启动。",
+	);
+	process.exit(1);
 }
 
-function handleHttp(req: IncomingMessage, res: ServerResponse): void {
-	let pathname = "/";
-	try {
-		pathname = new URL(req.url ?? "/", "http://localhost").pathname;
-	} catch {
-		res.writeHead(400).end();
-		return;
-	}
-	if (req.method === "GET" && pathname === "/api/health") {
-		serveHealth(req, res);
-		return;
-	}
-	if (req.method === "GET" && serveStatic(pathname, res)) return;
-	res.writeHead(404).end("not found");
-}
+const httpServer = createServer(app);
+const wss = new WebSocketServer({
+	noServer: true,
+	// 上调入站帧上限：右键上传走单帧 base64（100MB 文件 → ~133MB 帧），
+	// ws 默认 maxPayload 只有 100MB，超限会直接断连。
+	maxPayload: 256 * 1024 * 1024,
+	// Per-message deflate: big-session snapshots serialize to multi-MB JSON
+	// strings; wire-level compression cuts that several-fold. threshold keeps
+	// tiny messages (notices/heartbeats) uncompressed to save CPU.
+	perMessageDeflate: { threshold: 16 * 1024 },
+});
 
-/** host or host:port -> lowercased hostname + port (default 80). */
+// ---------------------------------------------------------------------------
+// Origin / Host admission for WebSocket upgrades.
+//
+// Browsers attach an Origin header; non-browser clients (curl, ws scripts)
+// usually don't — they're admitted by the network layer / reverse proxy.
+// Rules (checked in order):
+//   4. No Origin header → admit (non-browser client).
+//   5. Anything else → 403 + close.
+//
+// Dev-mode note: the Vite dev server (:5173) proxies /ws to the backend on
+// :8788, so their authorities differ — the dev:server script sets
+// PI_WEB_ALLOW_ORIGINS=http://localhost:5173,http://127.0.0.1:5173 for that.
+// LAN / reverse-proxy setups add their own origin the same way.
+// ---------------------------------------------------------------------------
+
+/** "host" or "host:port" → { hostname, port }. */
 function parseAuthority(a: string): { hostname: string; port: string } {
 	try {
 		const u = new URL(`http://${a}`);
@@ -134,70 +457,45 @@ function parseAuthority(a: string): { hostname: string; port: string } {
 	}
 }
 
-/**
- * Loopback literals only. Anything else as Host/Origin is a DNS-rebinding
- * suspect (attacker domain resolving to 127.0.0.1), even when Host and
- * Origin match each other. WHATWG URL keeps IPv6 brackets in `hostname`,
- * so both `::1` and `[::1]` are accepted.
- */
-function isLoopbackHostname(hostname: string): boolean {
-	return (
-		hostname === "localhost" ||
-		hostname === "127.0.0.1" ||
-		hostname === "::1" ||
-		hostname === "[::1]"
-	);
-}
-
-/**
- * Upgrade admission: the server binds 127.0.0.1 only, so the Host must be a
- * loopback authority and a browser Origin must be same-authority http(s).
- * Vite dev proxies /ws with a `localhost:5173` Host, which is accepted.
- */
-export function originAllowed(req: IncomingMessage): boolean {
-	const host = parseAuthority((req.headers.host ?? "").toLowerCase());
-	// Rebinding guard first: reject evil.com -> 127.0.0.1 outright, even when
-	// Origin matches the spoofed Host.
-	if (!isLoopbackHostname(host.hostname)) return false;
-	const origin = req.headers.origin;
-	if (!origin) return true; // non-browser client on loopback
-	let o: URL;
-	try {
-		o = new URL(origin);
-	} catch {
-		return false; // includes the opaque "null" origin
+function originAllowed(req: IncomingMessage): boolean {
+	const hostHeader = (req.headers.host ?? "").toLowerCase();
+	const host = parseAuthority(hostHeader);
+	if (ALLOW_HOSTS.length > 0 && !ALLOW_HOSTS.includes(host.hostname)) {
+		return false;
 	}
-	// Browsers send the page's http(s) origin on WS upgrades; anything else
-	// (file:, ws:, custom schemes) is not a trusted web page.
-	if (o.protocol !== "http:" && o.protocol !== "https:") return false;
-	const oriHostname = o.hostname.toLowerCase();
-	if (oriHostname !== host.hostname) return false; // same-authority host
-	if (!isLoopbackHostname(oriHostname)) return false; // belt-and-braces
-	const oriPort = o.port || (o.protocol === "https:" ? "443" : "80");
-	if (oriPort !== host.port) return false; // same-authority port
-	return true;
+	const origin = req.headers.origin;
+	if (!origin) return true; // non-browser client
+	const o = origin.toLowerCase();
+	if (ALLOW_ORIGINS.includes(o)) return true;
+	if (o === "null") return false; // file:// pages etc. are not trusted
+	const ori = parseAuthority(o.replace(/^[a-z]+:\/\//, ""));
+	if (ori.hostname === host.hostname && ori.port === host.port) return true;
+	// Browsers treat host:port pairs on the SAME host as different origins —
+	// do not accept them. (Dev-mode proxying is handled by PI_WEB_ALLOW_ORIGINS
+	// set in the dev:server script; LAN/reverse-proxy setups add their origin.)
+	return false;
 }
-
-const httpServer = createServer(handleHttp);
-const wss = new WebSocketServer({
-	noServer: true,
-	maxPayload: MAX_TEXT_BYTES,
-});
 
 httpServer.on("upgrade", (req, socket, head) => {
 	let pathname = "/";
 	try {
 		pathname = new URL(req.url ?? "/", "http://localhost").pathname;
 	} catch {
-		socket.destroy();
-		return;
+		/* fall through to the path check below */
 	}
 	if (pathname !== "/ws") {
 		socket.destroy();
 		return;
 	}
 	if (!originAllowed(req)) {
+		// Reject cross-origin browser pages outright. The browser sees a failed
+		// WS connect; the page's own reconnect loop then backs off and retries.
 		socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+		socket.destroy();
+		return;
+	}
+	if (AUTH_TOKEN && !tokenOk(req)) {
+		socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
 		socket.destroy();
 		return;
 	}
@@ -206,129 +504,580 @@ httpServer.on("upgrade", (req, socket, head) => {
 	});
 });
 
-export interface ConnectionOptions {
-	cwd: string;
-	deps?: ChatSessionDeps;
+// Heartbeat: lets clients detect half-open connections (server killed without
+// closing sockets, sleep/wake, network partitions). Idle connections otherwise
+// carry no traffic and TCP keepalive defaults are far too slow (~2h).
+const heartbeatTimer = setInterval(() => {
+	for (const ws of wss.clients) {
+		if (ws.readyState === WebSocket.OPEN) {
+			ws.send(JSON.stringify({ type: "heartbeat" } satisfies ServerMessage));
+		}
+	}
+}, 10_000);
+
+const service = new AgentService(
+	CWD,
+	// Per-client persisted UI state: last-used workspace + recent projects.
+	join(DATA_DIR, "client-state.json"),
+);
+
+// ---------------------------------------------------------------------------
+// Self-update
+// ---------------------------------------------------------------------------
+// In-app updates now run `npm i -g pi-web-ui@latest` in a visible terminal
+// tab (frontend-initiated); after it finishes the user restarts via
+// `pi-web-ui server restart`. The PI_WEB_RESTART_CHILD port-wait handshake
+// below stays: an externally orchestrated replacement child still needs it.
+
+function scheduleQuit(): boolean {
+	const isLaunchd = process.platform === "darwin" && process.ppid === 1;
+	const isSystemd = process.platform === "linux" && !!process.env.INVOCATION_ID;
+	// Windows `server install` runs the server under the powershell watchdog
+	// launcher (`while ($true) { node …; Start-Sleep 10 }`) — exiting brings it
+	// back within ~10s, same contract as launchd/systemd (see launch-origin.ts).
+	const isWinWatchdog = ORIGIN.supervisor === "windows-watchdog";
+	const inDocker = existsSync("/.dockerenv");
+	if (isLaunchd || isSystemd || isWinWatchdog || inDocker) {
+		setTimeout(() => {
+			console.log("pi-web-ui:quit — shutting down (supervisor will restart)…");
+			if (isSystemd) process.exit(3);
+			void shutdown();
+		}, 300);
+		return true;
+	}
+	setTimeout(() => {
+		console.log("pi-web-ui:quit — shutting down (restart to reload)…");
+		void shutdown();
+	}, 300);
+	return true;
 }
+service.onQuit = scheduleQuit;
+
+/** 背压相对倍数：socket 未发送积压超过「最近一份 snapshot 大小 × 此倍数」时丢弃
+ *  （issue #11 及其评论区的自适应建议）。固定 1MB 阈值在长会话下单份 snapshot 可达
+ *  ~10MB——连半份都没发完就丢，前端频繁跳帧；短会话又太迟钝。相对阈值语义稳定在
+ *  「缓冲堆了约 N 份快照」，不随会话长短漂移。 */
+const SNAPSHOT_BACKPRESSURE_FACTOR = 3;
+/** 背压绝对下限：低于此积压永不丢快照（小会话的相对阈值只有几 KB，会被
+ *  正常的消息突发误伤，见 send() 内注释）。 */
+const SNAPSHOT_BACKPRESSURE_MIN_BYTES = 262_144;
+/** 背压丢弃后的延迟重发间隔。 */
+const SNAPSHOT_RETRY_MS = 250;
 
 /**
- * Per-socket WS handler (extracted for testing). Contract:
- * - `ready` is sent ONLY after the SDK session starts successfully.
- * - If session creation rejects, the socket gets one `error` and is closed
- *   (1011) so the UI can never appear connected; the half-open ChatSession
- *   is disposed and further messages get a "session failed" error.
+ * Multi-tab serialization sharing: emit() hands the SAME message object to
+ * every socket of a client, but each send() used to JSON.stringify it
+ * separately — N open tabs serialized the same multi-MB snapshot N times per
+ * push. Keyed by object identity (WeakMap): a new snapshot is a new object,
+ * so the cache self-invalidates and never grows.
  */
-export function createConnectionHandler({ cwd, deps = defaultDeps }: ConnectionOptions) {
-	return (ws: WebSocket): void => {
+const serializedCache = new WeakMap<ServerMessage, string>();
+function serializeShared(msg: ServerMessage): string {
+	let s = serializedCache.get(msg);
+	if (s === undefined) {
+		s = JSON.stringify(msg);
+		serializedCache.set(msg, s);
+	}
+	return s;
+}
+
+wss.on("connection", (ws) => {
+	// Count attached sockets (the control socket reports REAL sockets, not
+	// cached client-session objects).
+	service.noteSocketOpen();
+	let clientId: string | null = null;
 	let closed = false;
-	let started = false;
-	let startFailed = false;
-	const send = (msg: ServerMessage): void => {
-		if (closed || ws.readyState !== WebSocket.OPEN) return;
-		try {
-			ws.send(JSON.stringify(msg));
-		} catch {
-			// best effort on a dying socket
-		}
-	};
+	/** 最近一份全量 snapshot 的估算字节数（UTF-16 ×2），供背压相对阈值用（issue #11）。 */
+	let lastSnapshotBytes = 0;
+	/** Commands received while the session is still being created — replayed after attach. */
+	let pending: ClientMessage[] = [];
+	/** 背压丢快照后的延迟重发定时器（去重：一次只排一个）。 */
+	let snapshotRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
-	const chat = new ChatSession(send);
-	chat
-		.start(cwd, deps)
-		.then(() => {
-			if (closed) return;
-			started = true;
-			send({ type: "ready", model: null });
-		})
-		.catch((err: unknown) => {
-			startFailed = true;
-			chat.dispose();
-			if (closed) return;
-			send({
-				type: "error",
-				message: `failed to start session: ${err instanceof Error ? err.message : String(err)}`,
-			});
-			try {
-				ws.close(1011, "session start failed");
-			} catch {
-				// already closing
-			}
-		});
-
-	ws.on("error", () => {
+	// 协议层错误（非法帧/未 masked 帧等）：不注册 handler 会作为 uncaught
+	// exception 打崩整个进程（issue #11 附带发现）。记日志并按坏连接关闭。
+	ws.on("error", (err) => {
+		console.error(`[ws] socket error${clientId ? ` (${clientId})` : ""}:`, err.message);
 		try {
 			ws.close();
 		} catch {
-			// already closing
+			/* already closing */
 		}
 	});
 
-	ws.on("message", (data: RawData) => {
-		if (!started) {
-			// Never buffer prompts for a session that does not exist yet:
-		// a failed start must not look like a live (but silent) connection.
-			send({
-				type: "error",
-				message: startFailed ? "session failed to start" : "session not ready",
-			});
+	const send = (msg: ServerMessage): void => {
+		if (closed || ws.readyState !== WebSocket.OPEN) return;
+		// 发送背压（issue #11）：socket 消费不过来时（前端慢/网络差），堆里会堆积
+		// 每份可达 ~10MB 的全量 snapshot 字符串，低内存主机直接 OOM。snapshot 是全量
+		// 幂等的且稍后必有更新的一份，可以安全丢弃——在序列化之前丢，连
+		// stringify 的分配都省掉。ready/notice/error/tool_delta 等消息必须送达。
+		// 阈值相对化（评论区建议）：用「最近一份 snapshot 的字节数 × 倍数」做基准，
+		// 首份无基准不丢（首次必达）。wire.length 是 UTF-16 字符数，×2 估算字节。
+		// 下限保护（小会话误伤修复）：小会话一份 snapshot 才 ~1KB，相对阈值只有几
+		// KB——前面一批 settings_state/slash_commands 的正常突发就能把 bufferedAmount
+		// 抬过阈值，把紧随其后的 snapshot_delta 静默丢掉；而丢弃后若无后续事件就
+		// 再也没有快照，客户端永远停在旧状态（前端靠 rev 缺口 get_state 自愈，
+		// 协议测试则直接卡死）。绝对下限保证小会话永不触发背压。
+		if (
+			(msg.type === "snapshot" || msg.type === "snapshot_delta") &&
+			lastSnapshotBytes > 0 &&
+			ws.bufferedAmount > Math.max(SNAPSHOT_BACKPRESSURE_MIN_BYTES, SNAPSHOT_BACKPRESSURE_FACTOR * lastSnapshotBytes)
+		) {
+			// 真正的慢客户端：丢弃是安全的，但不能「丢完就没了」——安排一次延迟
+			// 重发，等缓冲排空后快照最终必达（否则若此后再无事件，客户端将永久
+			// 停留在旧快照）。重发仍走 flushSnapshot：缓冲未排空则再次顺延。
+			if (!snapshotRetryTimer) {
+				snapshotRetryTimer = setTimeout(() => {
+					snapshotRetryTimer = null;
+					service.get(clientId ?? "")?.flushSnapshot();
+				}, SNAPSHOT_RETRY_MS);
+			}
 			return;
 		}
-		let raw: string;
+		const wire = serializeShared(msg);
+		if (msg.type === "snapshot") lastSnapshotBytes = wire.length * 2;
+		ws.send(wire);
+	};
+
+	const dispatch = (msg: ClientMessage): void => {
+		if (!clientId) {
+			pending.push(msg);
+			return;
+		}
+		const cs = service.get(clientId);
+		if (!cs) {
+			// Session not ready yet (hello processing) — hold the command.
+			pending.push(msg);
+			return;
+		}
+		// Managed instances do not install software on themselves, and tabs this
+		// instance does not offer stay closed. Both refusals live here, on the
+		// server, because hiding them in the client would still leave the message
+		// reachable to anything that can open the socket. See managed.ts / tabs.ts.
+		const refusal = managedRefusal(msg.type, MANAGED) ?? tabsRefusal(msg.type, TABS);
+		if (refusal) {
+			send({ type: "notice", level: "error", text: refusal });
+			return;
+		}
+		switch (msg.type) {
+			case "prompt":
+				void cs.prompt(msg.text, msg.attachments, msg.queue);
+				break;
+			case "queue_remove":
+				cs.removeQueued(msg.kind, msg.text);
+				break;
+			case "abort":
+				void cs.abort();
+				break;
+			case "abort_bash":
+				void cs.abortBash();
+				break;
+			case "open_worker":
+				void cs.openWorker(msg.workerId);
+				break;
+			case "close_worker":
+				cs.closeWorker(msg.workerId);
+				break;
+			case "cancel_worker":
+				cs.cancelWorker(msg.workerId);
+				break;
+			case "retry_last":
+				void cs.retryLast();
+				break;
+			case "kill_background_server":
+				void cs.killBackgroundServer(msg.port);
+				break;
+			case "kill_background_servers":
+				void cs.killAllBackgroundServers();
+				break;
+			case "list_bg_servers":
+				void cs.listBgServers();
+				break;
+			case "pick_project_folder":
+				void pickProjectFolder(cs.cwd)
+					.then(async (path) => {
+						if (path && ws.readyState === WebSocket.OPEN) await cs.setCwd(path);
+					})
+					.catch((err: Error) => {
+						send({
+							type: "notice",
+							level: "error",
+							text: `Could not open folder picker: ${err.message}`,
+						});
+					});
+				break;
+			case "new_chat":
+				void cs.newChat(msg.cwd);
+				break;
+			case "edit_message":
+				void cs.editMessage(msg.messageId, msg.text, msg.attachments);
+				break;
+			case "cycle_model":
+				void cs.cycleModel();
+				break;
+			case "cycle_thinking":
+				cs.cycleThinking();
+				break;
+			case "get_state":
+				// Always a FULL snapshot: the client is (re)connecting or detected
+				// a rev/seq gap — it needs an authoritative state to rebuild from.
+				cs.flushSnapshot(true);
+				break;
+			case "get_commands":
+				void cs.pushSlashCommands();
+				break;
+			case "list_sessions":
+				void cs.refreshSessions(msg.cwd);
+				break;
+			case "list_projects":
+				void cs.pushProjects();
+				break;
+			case "remove_project":
+				void cs.removeProject(msg.path);
+				break;
+			case "worktree_add":
+				void cs.addWorktree(msg.cwd, msg.branch);
+				break;
+			case "worktree_remove":
+				void cs.removeWorktree(msg.path, msg.force);
+				break;
+			case "delete_session":
+				void cs.deleteSession(msg.path);
+				break;
+			case "rename_session":
+				void cs.renameSession(msg.path, msg.name);
+				break;
+			case "rename_conversation":
+				void cs.renameConversation(msg.id, msg.name);
+				break;
+			case "dismiss_conversation":
+				void cs.dismissConversation(msg.id, msg.force);
+				break;
+			case "switch_session":
+				void cs.switchSession(msg.path);
+				break;
+			case "switch_conversation":
+				void cs.switchConversation(msg.id);
+				break;
+			case "list_files":
+				void cs.listFiles(msg.path);
+				break;
+			case "search_files":
+				void cs.searchFiles(msg.query, msg.reqId);
+				break;
+			case "search_sessions":
+				void cs.searchSessions(msg.query, msg.reqId);
+				break;
+			case "scm_status":
+				void cs.scmQuery("status", msg.reqId);
+				break;
+			case "scm_history":
+				void cs.scmQuery("history", msg.reqId);
+				break;
+			case "scm_filediff":
+				void cs.scmQuery("filediff", msg.reqId, { path: msg.path });
+				break;
+			case "scm_commit":
+				void cs.scmQuery("commit", msg.reqId, { hash: msg.hash });
+				break;
+			case "read_file":
+				void cs.readFile(msg.path);
+				break;
+			case "write_file":
+				void cs.writeFile(msg.path, msg.text);
+				break;
+			case "upload_file":
+				void cs.uploadFile(msg.dirPath, msg.name, msg.data);
+				break;
+			case "list_models":
+				void cs.listModels();
+				break;
+			case "set_model":
+				void cs.setModel(msg.modelId);
+				break;
+			case "set_thinking":
+				cs.setThinking(msg.level);
+				break;
+			case "set_cwd":
+				void cs.setCwd(msg.path);
+				break;
+			case "complete_path":
+				void cs.completePath(msg.path);
+				break;
+			case "make_dir":
+				void cs.makeDir(msg.path);
+				break;
+			case "restart_service": {
+				// Same effect as `pi-web-ui server restart`: this process exits and its
+				// supervisor brings it back (launchd/systemd immediately, the Windows
+				// watchdog within ~10s). Refused without a supervisor — exiting there
+				// would just stop the server the user is looking at.
+				if (!ORIGIN.supervisor) {
+					send({
+						type: "notice",
+						level: "error",
+						text: "This instance runs in the foreground, not as a pi-web-ui service — nothing would bring it back. Restart it in its terminal, or install the service with `pi-web-ui server install`.",
+					});
+					break;
+				}
+				send({
+					type: "notice",
+					level: "info",
+					text: "Restarting the service… this page reconnects once it is back.",
+				});
+				// Let the notice (and this socket's backlog) flush before we go down.
+				setTimeout(() => void scheduleQuit(), 400);
+				break;
+			}
+			case "dialog_response":
+				cs.resolveDialog(msg.id, msg.value);
+				break;
+			case "install_pi_agent":
+				void cs.installPiAgent();
+				break;
+			case "set_provider_api_key":
+				void cs.setProviderApiKey(msg.provider, msg.apiKey);
+				break;
+			case "clear_provider_api_key":
+				void cs.clearProviderApiKey(msg.provider);
+				break;
+			case "list_models_config":
+				void cs.listModelsConfig();
+				break;
+			case "reload_models_config":
+				void cs.reloadModelsConfig();
+				break;
+			case "save_model_config":
+				void cs.saveModelConfig(msg.providerId, msg.config);
+				break;
+			case "delete_model_config":
+				void cs.deleteModelConfig(msg.providerId);
+				break;
+			case "list_providers":
+				void cs.listProviders();
+				break;
+			case "fetch_models":
+				void cs.fetchModelsList(msg.reqId, msg.baseUrl, msg.apiKey, msg.authHeader, msg.api);
+				break;
+			case "refresh_provider_models":
+				void cs.refreshProviderModels(msg.providerId, msg.reqId);
+				break;
+			case "clone_provider":
+				void cs.cloneProvider(msg.provider, msg.reqId);
+				break;
+			case "list_provider_keys":
+				cs.listProviderKeys();
+				break;
+			case "add_provider_key":
+				void cs.addProviderKey(msg.provider, msg.apiKey, msg.name);
+				break;
+			case "activate_provider_key":
+				void cs.activateProviderKey(msg.provider, msg.keyName);
+				break;
+			case "remove_provider_key":
+				void cs.removeProviderKey(msg.provider, msg.keyName);
+				break;
+			case "terminal_create": {
+				const tm = cs.getTerminalManager(msg.conversationId);
+				if (tm)
+					tm.create(msg.terminalId, msg.cwd, msg.cols, msg.rows, cs.getTerminalCwd(msg.conversationId), msg.title);
+				break;
+			}
+			case "terminal_input":
+				cs.getTerminalManager(msg.conversationId)?.input(msg.terminalId, msg.data);
+				break;
+			case "terminal_resize":
+				cs.getTerminalManager(msg.conversationId)?.resize(msg.terminalId, msg.cols, msg.rows);
+				break;
+			case "terminal_kill":
+				cs.getTerminalManager(msg.conversationId)?.kill(msg.terminalId);
+				break;
+			case "rename_terminal":
+				cs.getTerminalManager(msg.conversationId)?.rename(msg.terminalId, msg.title);
+				break;
+			case "run_command":
+				cs.getTerminalManager(msg.conversationId)?.runCommand(
+					msg.terminalId,
+					msg.command,
+					msg.cols,
+					msg.rows,
+					cs.getTerminalCwd(msg.conversationId),
+				);
+				break;
+			case "list_commands":
+				void cs.listCommands();
+				break;
+			case "save_commands":
+				void cs.saveCommands(msg.commands);
+				break;
+			case "get_settings":
+				cs.pushSettings();
+				break;
+			case "set_settings":
+				void cs.setSettings({
+					promptMode: msg.promptMode,
+					customSystemPrompt: msg.customSystemPrompt,
+					promptTemplate: msg.promptTemplate,
+					promptOverrides: msg.promptOverrides,
+					disabledSkills: msg.disabledSkills,
+					disabledExtensions: msg.disabledExtensions,
+					disabledAgentTools: msg.disabledAgentTools,
+					terminalToolsEnabled: msg.terminalToolsEnabled,
+					terminalBash: msg.terminalBash,
+					terminalBashIdleMs: msg.terminalBashIdleMs,
+					questionnaireEnabled: msg.questionnaireEnabled,
+					thinkingWrap: msg.thinkingWrap,
+					toolsWrap: msg.toolsWrap,
+					skillsFullText: msg.skillsFullText,
+					retryMaxAttempts: msg.retryMaxAttempts,
+				});
+				break;
+			case "extensions_reload":
+				void cs.reloadExtensions();
+				break;
+			case "question_answer":
+				void cs.answerQuestion(msg.id, msg.answers, msg.cancelled);
+				break;
+			case "save_preset":
+				void cs.savePreset(msg.name);
+				break;
+			case "apply_preset":
+				void cs.applyPreset(msg.name);
+				break;
+			case "delete_preset":
+				void cs.deletePreset(msg.name);
+				break;
+			default:
+				break;
+		}
+	};
+
+	ws.on("message", (data) => {
+		let msg: ClientMessage;
 		try {
-			raw = data.toString();
+			msg = JSON.parse(data.toString()) as ClientMessage;
 		} catch {
 			return;
 		}
-		if (raw.length > MAX_TEXT_BYTES) {
-			send({ type: "error", message: "message too large" });
+
+		if (msg.type === "hello") {
+			const cid = msg.clientId || randomUUID();
+			clientId = cid;
+			service
+				.attach(cid, send)
+				.then((cs) => {
+					if (closed) return;
+					send({
+						type: "ready",
+						clientId: cid,
+						serverVersion: VERSION,
+						protocolVersion: PROTOCOL_VERSION,
+						// This package's own version. `serverVersion` is the pi SDK's,
+						// and the client used to learn ours from the update check —
+						// which a managed instance never runs.
+						appVersion: appVersion(),
+						managed: MANAGED,
+						tabs: TABS ? [...TABS] : undefined,
+						service: SERVICE_INFO ?? undefined,
+					});
+					cs.flushSnapshot();
+					// Replay anything that arrived while the session was starting.
+					const queued = pending;
+					pending = [];
+					for (const m of queued) dispatch(m);
+				})
+				.catch((err: unknown) => {
+					// Admission refused (quiesce): close the socket so the browser
+					// reconnect loop keeps retrying until admission reopens. Do NOT
+					// leave a half-alive connection that can only show an error.
+					if (err instanceof QuiesceRejectedError) {
+						closed = true;
+						if (ws.readyState === WebSocket.OPEN) {
+							ws.close(4403, "quiesced");
+						}
+						ws.terminate?.();
+						return;
+					}
+					// Real init failure (bad agent dir etc.) — keep the connection
+					// open so the user can see the error and fix it.
+					send({
+						type: "notice",
+						level: "error",
+						text: `Failed to initialize session: ${(err as Error).message}`,
+					});
+				});
 			return;
 		}
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(raw) as unknown;
-		} catch {
-			send({ type: "error", message: "invalid JSON message" });
-			return;
-		}
-		// Shape gate: JSON null/strings/numbers must never reach `msg.type`
-		// (`null.type` throws inside the listener and kills the socket).
-		if (typeof parsed !== "object" || parsed === null) {
-			send({ type: "error", message: "invalid message shape" });
-			return;
-		}
-		const msg = parsed as ClientMessage;
-		if (msg.type === "prompt") {
-			if (typeof msg.text !== "string" || msg.text.trim().length === 0) {
-				send({ type: "error", message: "prompt text must be non-empty" });
-				return;
-			}
-			if (msg.text.length > MAX_TEXT_BYTES) {
-				send({ type: "error", message: "prompt text too large" });
-				return;
-			}
-			void chat.prompt(msg.text);
-			return;
-		}
-		if (msg.type === "abort") {
-			void chat.abort();
-			return;
-		}
-		send({ type: "error", message: "unknown message type" });
+
+		dispatch(msg);
 	});
 
 	ws.on("close", () => {
+		service.noteSocketClose();
 		closed = true;
-		chat.dispose();
+		pending = [];
+		if (snapshotRetryTimer) {
+			clearTimeout(snapshotRetryTimer);
+			snapshotRetryTimer = null;
+		}
+		if (clientId) service.detach(clientId, send);
 	});
-	};
+});
+
+// When spawned by the old process as an auto-restart replacement, wait for
+// the old instance to release the port before binding (it exits right after
+// spawning us). Probe by attempting a connection: refused = free.
+if (process.env[RESTART_CHILD_ENV] === "1") {
+	const deadline = Date.now() + 20_000;
+	const portFree = () =>
+		new Promise<boolean>((resolve) => {
+			const sock = createConnection({ port: PORT, host: "127.0.0.1" });
+			sock.once("connect", () => {
+				sock.destroy();
+				resolve(false); // busy — old instance still up
+			});
+			sock.once("error", () => resolve(true)); // refused → free
+			sock.setTimeout(500, () => {
+				sock.destroy();
+				resolve(false);
+			});
+		});
+	while (Date.now() < deadline) {
+		if (await portFree()) break;
+		await new Promise((r) => setTimeout(r, 300));
+	}
 }
 
-wss.on("connection", createConnectionHandler({ cwd: CWD }));
+httpServer.listen(PORT, HOST, () => {
+	console.log("");
+	console.log("  ⚡ Dispatch Web — web chat for the pi coding agent");
+	console.log(`    http://localhost:${PORT}`);
+	console.log(`    workspace   : ${CWD}`);
+	console.log(`    session dir : ${SESSION_DIR_ROOT}`);
+	console.log(`    pi SDK      : v${VERSION}`);
+	console.log(`    bind        : ${HOST}:${PORT}`);
+	console.log("");
+});
 
-// Called by main.ts, never when tests import this module. Main-module path
-// comparisons are unreliable under tsx (its loader changes import.meta.url).
-export function startServer(): void {
-	httpServer.listen(PORT, HOST, () => {
-		console.log(`learn chat bridge on http://${HOST}:${PORT} (cwd: ${CWD})`);
-	});
+// 上传文件保留期清理：启动扫一次 + 每 6 小时一次（best-effort，见 uploads.ts）
+scheduleUploadCleanup();
+
+// Local control socket (status / quiesce / unquiesce) — same data dir the
+// CLI uses, so `pi-web-ui server status|quiesce|unquiesce` just works.
+const stopControl = startControlServer({ service, dataDir: DATA_DIR, port: PORT });
+
+let shuttingDown = false;
+async function shutdown(): Promise<void> {
+	if (shuttingDown) return;
+	shuttingDown = true;
+	console.log("\nshutting down…");
+	clearInterval(heartbeatTimer);
+	subscriptionUsage.dispose();
+	stopControl();
+	await service.disposeAll();
+	wss.close();
+	httpServer.close();
+	process.exit(0);
 }
+process.on("SIGINT", () => void shutdown());
+process.on("SIGTERM", () => void shutdown());
