@@ -23,7 +23,6 @@ export function useChat() {
   const [error, setError] = useState<string | null>(null);
   const [learnEvent, setLearnEvent] = useState<LearnEvent | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  const aliveRef = useRef(true);
   const readyRef = useRef(false);
   // Synchronous guards: state updates don't apply before the next render,
   // so two submits in the same tick would both see busy === false.
@@ -39,74 +38,80 @@ export function useChat() {
   };
 
   useEffect(() => {
-    aliveRef.current = true;
-    const ws = new WebSocket(wsUrl());
-    wsRef.current = ws;
+    let disposed = false;
+    let retry: ReturnType<typeof setTimeout> | undefined;
 
-    // A transport connection is not an initialized pi session. Only the
-    // server's ready message enables the composer.
-    ws.onopen = () => {
-      if (wsRef.current !== ws) return;
+    const connect = () => {
+      if (disposed) return;
       setStatus("connecting");
-    };
-    ws.onmessage = (ev) => {
-      if (wsRef.current !== ws) return;
-      let msg: ServerMessage;
-      try {
-        msg = JSON.parse(ev.data as string) as ServerMessage;
-      } catch {
-        return;
-      }
-      switch (msg.type) {
-        case "ready":
-          readyRef.current = true;
-          setStatus("open");
-          setModel(msg.model);
-          break;
-        case "delta":
-          setStreaming((prev) => prev + msg.text);
-          break;
-        case "done":
-          // Authoritative full text wins over streamed deltas. A turn that
-          // was aborted settles quietly: no duplicate/late reply appended.
-          if (!abortedRef.current) {
-            setMessages((prev) => [...prev, { role: "assistant", text: msg.text }]);
-          }
-          abortedRef.current = false;
-          setStreaming("");
-          setBusyBoth(false);
-          break;
-        case "error":
-          if (!abortedRef.current) {
-            setError(msg.message);
-          }
-          abortedRef.current = false;
-          setStreaming("");
-          setBusyBoth(false);
-          break;
-        case "learn_event":
-          setLearnEvent(msg.event);
-          break;
-      }
-    };
-    ws.onclose = () => {
-      if (wsRef.current !== ws || !aliveRef.current) return;
-      wsRef.current = null;
-      setStatus("closed");
-      readyRef.current = false;
-      abortedRef.current = false;
-      setBusyBoth(false);
-    };
-    ws.onerror = () => {
-      if (wsRef.current !== ws || !aliveRef.current) return;
-      setError("Connection error");
+      const ws = new WebSocket(wsUrl());
+      wsRef.current = ws;
+
+      // A transport connection is not an initialized pi session. Only the
+      // server's ready message enables the composer.
+      ws.onmessage = (ev) => {
+        if (disposed || wsRef.current !== ws) return;
+        let msg: ServerMessage;
+        try {
+          msg = JSON.parse(ev.data as string) as ServerMessage;
+        } catch {
+          return;
+        }
+        switch (msg.type) {
+          case "ready":
+            readyRef.current = true;
+            setStatus("open");
+            setError(null);
+            setModel(msg.model);
+            break;
+          case "delta":
+            setStreaming((prev) => prev + msg.text);
+            break;
+          case "done":
+            // Authoritative full text wins over streamed deltas.
+            if (!abortedRef.current) {
+              setMessages((prev) => [...prev, { role: "assistant", text: msg.text }]);
+            }
+            abortedRef.current = false;
+            setStreaming("");
+            setBusyBoth(false);
+            break;
+          case "error":
+            if (!abortedRef.current) setError(msg.message);
+            abortedRef.current = false;
+            setStreaming("");
+            setBusyBoth(false);
+            break;
+          case "learn_event":
+            setLearnEvent(msg.event);
+            break;
+        }
+      };
+      ws.onclose = () => {
+        if (disposed || wsRef.current !== ws) return;
+        wsRef.current = null;
+        readyRef.current = false;
+        setStatus("closed");
+        setError((prev) => prev ?? "Backend offline. Start npm run dev (or npm run dev:server).");
+        abortedRef.current = false;
+        setStreaming("");
+        setBusyBoth(false);
+        retry = setTimeout(connect, 1500);
+      };
+      ws.onerror = () => {
+        if (disposed || wsRef.current !== ws) return;
+        setError((prev) => prev ?? "Backend offline. Start npm run dev (or npm run dev:server).");
+      };
     };
 
+    connect();
     return () => {
-      aliveRef.current = false;
+      disposed = true;
+      if (retry) clearTimeout(retry);
+      const ws = wsRef.current;
       wsRef.current = null;
       readyRef.current = false;
-      ws.close();
+      ws?.close();
     };
   }, []);
 

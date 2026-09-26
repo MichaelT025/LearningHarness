@@ -325,14 +325,10 @@ export function createConnectionHandler({ cwd, deps = defaultDeps }: ConnectionO
 
 wss.on("connection", createConnectionHandler({ cwd: CWD }));
 
-// Guarded so unit tests can import the pure helpers/handler without binding.
-const isMainModule =
-	process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-if (isMainModule) {
+// Called by main.ts, never when tests import this module. Main-module path
+// comparisons are unreliable under tsx (its loader changes import.meta.url).
+export function startServer(): void {
 	httpServer.listen(PORT, HOST, () => {
 		console.log(`learn chat bridge on http://${HOST}:${PORT} (cwd: ${CWD})`);
 	});
 }
-
-process.on("SIGINT", () => process.exit(0));
-process.on("SIGTERM", () => process.exit(0));

@@ -23,7 +23,7 @@ export default defineConfig({
     strictPort: true,
     proxy: {
       "/ws": {
-        target: `ws://localhost:${backendPort}`,
+        target: `ws://127.0.0.1:${backendPort}`,
         ws: true,
         configure(proxy) {
           proxy.on("error", (_err, _req, socket) => {
