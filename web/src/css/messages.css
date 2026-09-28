@@ -811,6 +811,11 @@
 		display: none;
 	}
 }
+
+.topic-start {
+	margin-top: 14px;
+}
+
 /* ── Mermaid diagrams (```mermaid fences) ────────────────────────────────── */
 .mermaid-block {
 	margin: 10px 0;

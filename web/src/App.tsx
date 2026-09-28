@@ -31,6 +31,7 @@ import { registerAttachmentSink } from "./composer-bridge";
 import { appendDraftAttachments } from "./composer-draft";
 import { PiSetupModal } from "./components/PiSetupModal";
 import { LearnRootModal } from "./components/LearnRootModal";
+import { cwdKey } from "./components/left-panel-nav";
 import { ModelConfigModal } from "./components/ModelConfigModal";
 
 import { SettingsModal } from "./components/SettingsModal";
@@ -729,6 +730,23 @@ export function App() {
 		[currentId, chat.snapshotsById],
 	);
 	const onJumpDone = useCallback(() => setSearchJump(null), []);
+	// Topic chats open empty and the tutor can't speak first: the empty state
+	// offers a one-click start that says hello on the learner's behalf.
+	const activeTopic = useMemo(
+		() => (cwd ? chat.topics.find((tp) => cwdKey(tp.cwd) === cwdKey(cwd)) : undefined),
+		[chat.topics, cwd],
+	);
+	const topicStarter = useMemo(
+		() =>
+			activeTopic
+				? {
+						title: activeTopic.title,
+						goal: activeTopic.goal,
+						onStart: () => void send({ type: "prompt", text: "Let's start." }),
+					}
+				: undefined,
+		[activeTopic, send],
+	);
 	// A requested new chat puts the caret in the composer at once (the same
 	// window event the welcome cards use — ChatInput owns the textarea).
 	const newChatSeq = chat.optimisticNewChat?.seq ?? 0;
@@ -877,6 +895,7 @@ export function App() {
 												toolsWrap={chat.settings?.toolsWrap ?? false} // Astra 默认折叠摘要；错误卡自动展开，对话框不受影响
 												jumpTarget={isCurrent ? searchJump : null}
 												onJumpDone={onJumpDone}
+												topicStarter={isCurrent ? topicStarter : undefined}
 											/>
 										</div>
 									);

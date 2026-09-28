@@ -169,6 +169,8 @@ interface MessageListProps {
 	 *  last few conversations mounted so switching back is instant). A parked
 	 *  list keeps its scroll position and owns no window-level shortcuts. */
 	active?: boolean;
+	/** Empty topic chat: the tutor can't speak first, so offer a start button. */
+	topicStarter?: { title: string; goal: string; onStart: () => void };
 }
 
 export function MessageList({
@@ -185,6 +187,7 @@ export function MessageList({
 	jumpTarget,
 	onJumpDone,
 	active = true,
+	topicStarter,
 }: MessageListProps) {
 	const t = useT();
 	const scrollRef = useRef<HTMLDivElement>(null);
@@ -756,8 +759,17 @@ export function MessageList({
 				{state.messages.length === 0 && !state.streamingMessage && (
 					<div className="empty-state astra-empty">
 						<Logo size={44} className="astra-empty-logo" />
-						<div className="astra-empty-mark">LearningHarness</div>
-						<div className="astra-empty-hint">{t("astraEmptyHint")}</div>
+						<div className="astra-empty-mark">{topicStarter ? topicStarter.title : "LearningHarness"}</div>
+						{topicStarter ? (
+							<>
+								{topicStarter.goal && <div className="astra-empty-hint">{topicStarter.goal}</div>}
+								<button type="button" className="btn primary topic-start" onClick={topicStarter.onStart}>
+									Start session
+								</button>
+							</>
+						) : (
+							<div className="astra-empty-hint">{t("astraEmptyHint")}</div>
+						)}
 					</div>
 				)}
 				{state.messages.map((m, i) => {
