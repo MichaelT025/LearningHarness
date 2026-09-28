@@ -747,3 +747,18 @@
 		display: none;
 	}
 }
+
+/* ── Mermaid diagrams (```mermaid fences) ────────────────────────────────── */
+.mermaid-block {
+	margin: 10px 0;
+	padding: 12px;
+	border: 1px solid var(--border-soft);
+	border-radius: var(--radius-md, 10px);
+	background: var(--bg-elev);
+	overflow-x: auto;
+	text-align: center;
+}
+.mermaid-block svg {
+	max-width: 100%;
+	height: auto;
+}

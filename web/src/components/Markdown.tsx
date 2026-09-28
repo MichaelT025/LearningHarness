@@ -9,6 +9,7 @@ import rehypeKatex from "rehype-katex";
 import rehypeRaw from "rehype-raw";
 import "katex/dist/katex.min.css";
 import { CopyButton } from "./copy-button";
+import { MermaidBlock } from "./MermaidBlock";
 import { splitCodeLines } from "../code-lines";
 
 interface MarkdownProps {
@@ -70,7 +71,19 @@ export const Markdown = memo(function Markdown({ text, rawHtml = false, hardBrea
 });
 
 function PreWithCopy({ children, ...props }: JSX.IntrinsicElements["pre"]) {
-	return <PlainCodeBlock children={children} {...props} />;
+	const plain = <PlainCodeBlock children={children} {...props} />;
+	if (codeLanguage(children) === "mermaid") {
+		return <MermaidBlock source={codeText(children).trim()} fallback={plain} />;
+	}
+	return plain;
+}
+
+/** Fence language of the <code> child (`language-xxx` class), if any. */
+function codeLanguage(children: unknown): string | undefined {
+	if (!children || typeof children !== "object" || !("props" in children)) return undefined;
+	const cls = (children as { props?: { className?: unknown } }).props?.className;
+	const m = typeof cls === "string" ? cls.match(/(?:^|\s)language-([\w-]+)/) : null;
+	return m?.[1];
 }
 
 /** 普通代码块（高亮 + 行号 + 复制按钮）——无插件认领语言的默认展示。 */
