@@ -104,6 +104,16 @@ import {
 } from "./session-preview.js";
 import { makeInputRequiredNotification, NotificationLifecycle } from "./notification-lifecycle.js";
 import { LearnRootConfig, TopicStore } from "./topics.js";
+import {
+	activateRegisteredTool,
+	buildTopicContext,
+	loadTutorPrompt,
+	makeNoteWriteTool,
+	makeTopicWriteGuard,
+	NOTE_WRITE_TOOL,
+	renderTutorSystemPrompt,
+	tutorToolSet,
+} from "./tutor.js";
 
 const SNAPSHOT_INTERVAL_MS = 60;
 /** While assistant deltas are flowing, live rendering is carried by
@@ -152,6 +162,8 @@ const INLINE_PERSONA_EXT = "<inline:pi-webui-persona>";
 /** 自家内联扩展（learn:demo 事件桥，见 learn-events.ts）。同 persona 一样是
  *  基础设施，不参与禁用过滤。SDK 以 "<inline:<name>>" 作为 path。 */
 const INLINE_LEARN_EXT = "<inline:pi-webui-learn>";
+/** 自家内联扩展（topic 写入护栏，见 tutor.ts）。仅 topic runtime 注册。 */
+const INLINE_TOPIC_GUARD_EXT = "<inline:pi-webui-topic-guard>";
 
 /** Pi 包文档路径（composer 的 {{pi_docs}} 自动内容用）。随安装位置解析一次。 */
 const PI_DOC_PATHS = (() => {
@@ -889,6 +901,25 @@ export class ClientSession {
 		return renderPromptTemplate(tpl || DEFAULT_PROMPT_TEMPLATE, texts, ovs);
 	}
 
+	/** Tutor system prompt for a topic cwd (undefined for any other cwd).
+	 *  Topics ignore the settings-panel template: engine/prompts/tutor.md is
+	 *  the editable surface for the tutor. */
+	private renderTopicPrompt(
+		cwd: string,
+		src: {
+			selectedTools: string[];
+			toolSnippets: Record<string, string>;
+			toolGuidelines: string[];
+			contextFiles: { path: string; content: string }[];
+			skills: { name: string; description: string; filePath: string }[];
+		},
+	): string | undefined {
+		const topic = this.topicStore.findByCwd(cwd);
+		if (!topic) return undefined;
+		const texts = resolveSectionTexts(this.composeInputs({ cwd, ...src }));
+		return renderTutorSystemPrompt(loadTutorPrompt(), texts, buildTopicContext(topic));
+	}
+
 	/** 从活动会话收集工具/资源快照 → 一次算出 ①各来源默认(自动)内容 ②实际生效的
 	 *  完整提示词。会话未就绪（或出错）返回 undefined，调用方给空值。 */
 	private sessionPromptSnapshot():
@@ -936,8 +967,12 @@ export class ClientSession {
 			const tpl = (this.settingsSvc.current.promptTemplate ?? "").trim();
 			const ovs = this.settingsSvc.current.promptOverrides ?? {};
 			const hasOverride = Object.values(ovs).some((v) => typeof v === "string" && v.trim());
-			const rendered =
-				!tpl && !hasOverride ? undefined : renderPromptTemplate(tpl || DEFAULT_PROMPT_TEMPLATE, texts, ovs);
+			const topic = this.topicStore.findByCwd(cwd);
+			const rendered = topic
+				? renderTutorSystemPrompt(loadTutorPrompt(), texts, buildTopicContext(topic))
+				: !tpl && !hasOverride
+					? undefined
+					: renderPromptTemplate(tpl || DEFAULT_PROMPT_TEMPLATE, texts, ovs);
 			return { texts, full: rendered ?? sess.systemPrompt, toolsSchema: buildToolsSchemaText(schemaEntries) };
 		} catch {
 			// Session not ready yet.
@@ -1121,6 +1156,9 @@ export class ClientSession {
 	 */
 	private makeRuntimeFactory(terminals: TerminalManager, ownerId?: string): CreateAgentSessionRuntimeFactory {
 		return async ({ cwd: effectiveCwd, sessionManager }) => {
+			// A topic conversation gets the tutor: note_write, the write guard,
+			// and (in before_agent_start) the tutor system prompt.
+			const topicDir = this.topicStore.findByCwd(effectiveCwd)?.cwd;
 			const services = await createAgentSessionServices({
 				cwd: effectiveCwd,
 				modelRuntime: this.sharedModelRuntime,
@@ -1170,7 +1208,9 @@ export class ClientSession {
 					extensionsOverride: (res) => {
 						// 自家内联扩展是基础设施，不参与禁用过滤。
 						const keepOwn = (e: { path: string }) =>
-							e.path.startsWith(INLINE_PERSONA_EXT) || e.path.startsWith(INLINE_LEARN_EXT);
+							e.path.startsWith(INLINE_PERSONA_EXT) ||
+							e.path.startsWith(INLINE_LEARN_EXT) ||
+							e.path.startsWith(INLINE_TOPIC_GUARD_EXT);
 						return {
 							...res,
 							extensions: res.extensions.filter(
@@ -1183,6 +1223,9 @@ export class ClientSession {
 					// {{token}} 展开为各来源文本（工具列表/项目上下文/技能等都取自本次 run
 					// 的 systemPromptOptions，永远最新）。
 					extensionFactories: [
+						...(topicDir
+							? [{ name: "pi-webui-topic-guard", hidden: true, factory: makeTopicWriteGuard(topicDir) }]
+							: []),
 						{
 							// learn:demo 事件桥（见 learn-events.ts）：每 run 在 agent_start
 							// 时 emit 一次，经版本校验后以 learn_event 经 ClientSession.emit
@@ -1216,8 +1259,32 @@ export class ClientSession {
 												skills?: { name: string; description?: string; filePath?: string }[];
 										  }
 										| undefined;
+									const runCwd = typeof opts?.cwd === "string" ? opts.cwd : this.cwd;
+									// Topic runs get the tutor's curated loadout, re-applied every
+									// run: extensions can reset the active set after creation, and
+									// pi reads the live loadout after these handlers.
+									let selectedTools = opts?.selectedTools ?? [];
+									if (topicDir) {
+										selectedTools = tutorToolSet(
+											pi.getActiveTools(),
+											pi.getAllTools().map((t) => t.name),
+										);
+										pi.setActiveTools(selectedTools);
+									}
+									const tutor = this.renderTopicPrompt(runCwd, {
+										selectedTools,
+										toolSnippets: opts?.toolSnippets ?? {},
+										toolGuidelines: opts?.promptGuidelines ?? [],
+										contextFiles: opts?.contextFiles ?? [],
+										skills: (opts?.skills ?? []).map((s) => ({
+											name: s.name,
+											description: s.description ?? "",
+											filePath: s.filePath ?? "",
+										})),
+									});
+									if (tutor) return { systemPrompt: tutor };
 									const rendered = this.renderMainCompose({
-										cwd: typeof opts?.cwd === "string" ? opts.cwd : this.cwd,
+										cwd: runCwd,
 										selectedTools: opts?.selectedTools ?? [],
 										toolSnippets: opts?.toolSnippets ?? {},
 										toolGuidelines: opts?.promptGuidelines ?? [],
@@ -1261,6 +1328,7 @@ export class ClientSession {
 					...makePersistentTerminalTools(terminals, effectiveCwd, () => this.getLang()),
 					// ask_user_question: model call → questionnaire dialog in the browser.
 					makeAskUserQuestionTool(this, ownerId),
+					...(topicDir ? [makeNoteWriteTool(topicDir)] : []),
 				],
 			});
 			// 终端工具开关从创建起就生效（工具始终注册进注册表，只调活跃集）。
@@ -2668,6 +2736,10 @@ export class ClientSession {
 	 *  所以这两条路径之后都要重放本方法（见 reloadSession/创建处）。 */
 	private applyToolGating(session: AgentSession): void {
 		applyAgentToolsGating(session, effectiveDisabledAgentTools(this.settingsSvc.current));
+		// Custom tools are registered inactive (pi only activates read/bash/
+		// edit/write by default). note_write is registered only for topic
+		// runtimes, so its presence means "tutor": switch it on.
+		activateRegisteredTool(session, NOTE_WRITE_TOOL);
 		// SDK 的 setActiveToolsByName 只改 agent.state.tools，不派发任何事件——门控后
 		// 主动推一次快照，否则快照里的 tools 要等下一个 SDK 事件才对齐（会话空闲时永远
 		// 等不到；回归：tests/terminal-smoke-test.mjs「agent exposes persistent terminal tools」）。
