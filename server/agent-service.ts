@@ -104,6 +104,7 @@ import {
 } from "./session-preview.js";
 import { makeInputRequiredNotification, NotificationLifecycle } from "./notification-lifecycle.js";
 import { LearnRootConfig, TopicStore } from "./topics.js";
+import { roleModel, type AgentRole } from "./agents-config.js";
 import {
 	activateRegisteredTool,
 	buildTopicContext,
@@ -1333,6 +1334,9 @@ export class ClientSession {
 			});
 			// 终端工具开关从创建起就生效（工具始终注册进注册表，只调活跃集）。
 			this.applyToolGating(created.session);
+			// A new topic conversation starts on the tutor role's model from
+			// config/agents.json (a resumed transcript keeps its own model).
+			if (topicDir) await this.applyRoleModel(created.session, services.modelRuntime, "tutor");
 			return {
 				...created,
 				services,
@@ -2644,6 +2648,55 @@ export class ClientSession {
 		}
 	}
 
+	/** Seed an empty session with a role's configured model (and thinking
+	 *  level). No-op for sessions that already have messages, for a missing or
+	 *  unknown model, or when the model has no credentials; the pi default
+	 *  then stays in place and a notice says why. */
+	private async applyRoleModel(
+		session: AgentSession,
+		modelRuntime: { getModel(provider: string, id: string): unknown },
+		role: AgentRole,
+	): Promise<void> {
+		const cfg = roleModel(role);
+		if (!cfg) return;
+		try {
+			if (session.getSessionStats().totalMessages > 0) return;
+			const model = modelRuntime.getModel(cfg.provider, cfg.modelId);
+			if (!model) {
+				this.noticeNowOrLater({
+					type: "notice",
+					level: "warning",
+					text: `config/agents.json: ${role} model ${cfg.provider}/${cfg.modelId} is not available; using the default model`,
+				});
+				return;
+			}
+			const cur = session.model;
+			if (!cur || cur.provider !== cfg.provider || cur.id !== cfg.modelId) {
+				await session.setModel(model as Parameters<AgentSession["setModel"]>[0]);
+			}
+			if (cfg.thinking) session.setThinkingLevel(cfg.thinking as Parameters<AgentSession["setThinkingLevel"]>[0]);
+		} catch (err) {
+			this.noticeNowOrLater({
+				type: "notice",
+				level: "warning",
+				text: `Could not switch to the ${role} model ${cfg.provider}/${cfg.modelId}: ${(err as Error).message}`,
+			});
+		}
+	}
+
+	/** True when new chats in `cwd` are seeded by a role model (topics use
+	 *  the tutor role), so the previous chat's model must not be carried over. */
+	private hasRoleDefault(cwd: string): boolean {
+		return !!this.topicStore.findByCwd(cwd) && roleModel("tutor") !== undefined;
+	}
+
+	/** Emit a notice now when a browser is attached, else queue it for the
+	 *  next attach (runtimes can be created before any socket exists). */
+	private noticeNowOrLater(msg: ServerMessage): void {
+		if (this.sinks.size > 0) this.emit(msg);
+		else this.pendingNotices.push(msg);
+	}
+
 	/** Per-project restores that follow EVERY switch into a project (provider
 	 *  keys, then the remembered model). Both can await the model runtime, so
 	 *  they run AFTER the switch snapshot has gone out — the client shows the
@@ -3317,8 +3370,9 @@ export class ClientSession {
 			// must see it, not the pre-newChat fridge snapshot.
 			this.invalidateSessionInfos();
 			// New session seeds with the ModelRuntime default model — restore the
-			// model the user had selected in the previous chat.
-			if (prevModel && this.sharedModelRuntime) {
+			// model the user had selected in the previous chat (unless a role
+			// default from config/agents.json already seeded this chat).
+			if (prevModel && this.sharedModelRuntime && !this.hasRoleDefault(this.cwd)) {
 				try {
 					await this.session.setModel(prevModel);
 					const p = (prevModel as unknown as { provider: string }).provider;
@@ -3391,7 +3445,7 @@ export class ClientSession {
 		this.flushSnapshot();
 		await this.restoreProjectProviderKeysForCwd(abs);
 		let modelChanged = await this.restoreProjectModelForCwd(abs);
-		if (!modelChanged && prevModel && this.sharedModelRuntime) {
+		if (!modelChanged && prevModel && this.sharedModelRuntime && !this.hasRoleDefault(abs)) {
 			const cur = this.session.model;
 			if (!cur || cur.provider !== prevModel.provider || cur.id !== prevModel.id) {
 				try {
