@@ -103,7 +103,7 @@ import {
 	type SerializeCache,
 } from "./session-preview.js";
 import { makeInputRequiredNotification, NotificationLifecycle } from "./notification-lifecycle.js";
-import { TopicStore } from "./topics.js";
+import { LearnRootConfig, TopicStore } from "./topics.js";
 
 const SNAPSHOT_INTERVAL_MS = 60;
 /** While assistant deltas are flowing, live rendering is carried by
@@ -1369,7 +1369,8 @@ export class ClientSession {
 		// Reconnect: push the built-in provider key list (multi-key grouping in the
 		// model picker needs it even before the client asks).
 		this.modelAdmin.listProviderKeys();
-		// Reconnect: push the learning-topic list (same as list_topics).
+		// Reconnect: push the learning root (first-run dialog) and topic list.
+		this.pushLearnRoot();
 		void this.pushTopics().catch(() => {
 			// best effort — a failed push must not break attach
 		});
@@ -3611,6 +3612,28 @@ export class ClientSession {
 		});
 	}
 
+	/** Push where learning data lives (and whether the user has chosen it). */
+	private pushLearnRoot(): void {
+		this.emit({ type: "learn_root", ...this.topicStore.rootInfo() });
+	}
+
+	/** First-run choice of the learning root. Rescans topics there. */
+	async setLearnRoot(root: string): Promise<void> {
+		return this.enqueueTopicNav(async () => {
+			try {
+				this.topicStore.configureRoot(root);
+			} catch (err) {
+				this.emit({
+					type: "notice",
+					level: "error",
+					text: `Could not use that folder: ${(err as Error).message}`,
+				});
+			}
+			this.pushLearnRoot();
+			await this.pushTopics();
+		});
+	}
+
 	/** Explicit client request (list_topics) — pushTopics on demand. */
 	async listTopics(): Promise<void> {
 		try {
@@ -3632,6 +3655,11 @@ export class ClientSession {
 				const trimmed = (title ?? "").trim();
 				if (!trimmed) {
 					this.emit({ type: "notice", level: "error", text: "Topic title is required" });
+					return;
+				}
+				if (!this.topicStore.rootInfo().configured) {
+					this.emit({ type: "notice", level: "error", text: "Choose a learning folder first" });
+					this.pushLearnRoot();
 					return;
 				}
 				const topic = await this.topicStore.create(trimmed, goal);
@@ -4795,7 +4823,7 @@ export class AgentService {
 		stateFile: string,
 	) {
 		this.stateStore = new ClientStateStore(stateFile);
-		this.topicStore = new TopicStore(dirname(stateFile));
+		this.topicStore = TopicStore.fromConfig(new LearnRootConfig(dirname(stateFile)));
 	}
 
 	/** Get or create the session for a client, racing attach calls safely. */

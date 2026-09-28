@@ -719,6 +719,9 @@ wss.on("connection", (ws) => {
 			case "select_topic":
 				void cs.selectTopic(msg.id);
 				break;
+			case "set_learn_root":
+				void cs.setLearnRoot(msg.root);
+				break;
 			case "remove_project":
 				void cs.removeProject(msg.path);
 				break;

@@ -1,15 +1,17 @@
 /**
  * topics unit tests: durable topic metadata store. Zero tokens, zero server.
  *
- * Covers the contract used by the rest of the app: create/validate, restart
- * persistence, distinct topic directories, cwd lookup (Windows case folding),
- * creation-descending listing, and recovery from corrupt/foreign folders.
+ * Covers the contract used by the rest of the app: slug folders under the
+ * learning root, create/validate, restart persistence, collisions with the
+ * user's own folders, cwd lookup (Windows case folding), creation-descending
+ * listing, recovery from corrupt/foreign folders, and the root config.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	existsSync,
 	mkdtempSync,
 	mkdirSync,
+	readdirSync,
 	readFileSync,
 	rmSync,
 	symlinkSync,
@@ -18,7 +20,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	defaultLearnRoot,
+	LearnRootConfig,
 	normalizeTopicCwd,
+	slugifyTitle,
 	TOPIC_GOAL_MAX,
 	TOPIC_METADATA_VERSION,
 	TOPIC_TITLE_MAX,
@@ -27,56 +32,97 @@ import {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
-let dataDir: string;
+let root: string;
 
-/** A store rooted at the shared temp dataDir. */
+/** A store rooted at the shared temp learning root. */
 function newStore(): TopicStore {
-	return new TopicStore(dataDir);
-}
-
-function topicFile(id: string): string {
-	return join(dataDir, "topics", id, "topic.json");
+	return new TopicStore(root);
 }
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((r) => setTimeout(r, ms));
 }
 
+/** Hand-write a topic folder (for recovery tests). */
+function writeTopic(folder: string, record: Record<string, unknown>): void {
+	mkdirSync(join(root, folder), { recursive: true });
+	writeFileSync(join(root, folder, "topic.json"), JSON.stringify(record));
+}
+
 beforeEach(() => {
-	dataDir = mkdtempSync(join(tmpdir(), "topics-test-"));
+	root = mkdtempSync(join(tmpdir(), "topics-test-"));
 });
 
 afterEach(() => {
-	rmSync(dataDir, { recursive: true, force: true });
+	rmSync(root, { recursive: true, force: true });
+});
+
+describe("slugifyTitle", () => {
+	it("folds to lowercase kebab-case ascii", () => {
+		expect(slugifyTitle("Intro to Rust")).toBe("intro-to-rust");
+		expect(slugifyTitle("  C++ / Templates!! ")).toBe("c-templates");
+		expect(slugifyTitle("Café Économie")).toBe("cafe-economie");
+	});
+
+	it("falls back when nothing usable is left, and avoids device names", () => {
+		expect(slugifyTitle("闭包")).toBe("topic");
+		expect(slugifyTitle("???")).toBe("topic");
+		expect(slugifyTitle("CON")).toBe("con-topic");
+		expect(slugifyTitle("nul")).toBe("nul-topic");
+	});
+
+	it("caps length without a trailing hyphen", () => {
+		const s = slugifyTitle(`${"a".repeat(59)} b`);
+		expect(s.length).toBeLessThanOrEqual(60);
+		expect(s.endsWith("-")).toBe(false);
+	});
 });
 
 describe("create", () => {
-	it("trims title/goal, allocates a UUID workspace and flat session dir", () => {
+	it("trims title/goal and makes a slug folder with notes/ and sessions/", () => {
 		const store = newStore();
 		const t = store.create("  Intro to Rust  ", "  Learn ownership  ");
 
 		expect(t.id).toMatch(UUID_RE);
 		expect(t.title).toBe("Intro to Rust");
 		expect(t.goal).toBe("Learn ownership");
-		expect(typeof t.createdAt).toBe("number");
-		expect(t.cwd).toBe(join(dataDir, "topics", t.id, "workspace"));
-		expect(existsSync(t.cwd)).toBe(true);
-		expect(existsSync(join(dataDir, "topics", t.id, "sessions"))).toBe(true);
+		expect(t.cwd).toBe(join(root, "intro-to-rust"));
+		expect(existsSync(join(t.cwd, "notes"))).toBe(true);
+		expect(existsSync(join(t.cwd, "sessions"))).toBe(true);
 
-		const onDisk = JSON.parse(readFileSync(topicFile(t.id), "utf8"));
+		const onDisk = JSON.parse(readFileSync(join(t.cwd, "topic.json"), "utf8"));
 		expect(onDisk).toEqual({
 			version: TOPIC_METADATA_VERSION,
 			id: t.id,
+			slug: "intro-to-rust",
 			title: "Intro to Rust",
 			goal: "Learn ownership",
 			createdAt: t.createdAt,
-			cwd: t.cwd,
 		});
 	});
 
+	it("creates the root when it does not exist yet", () => {
+		const store = new TopicStore(join(root, "nested", "Learning"));
+		const t = store.create("First");
+		expect(t.cwd).toBe(join(root, "nested", "Learning", "first"));
+		expect(existsSync(t.cwd)).toBe(true);
+	});
+
 	it("defaults a missing goal to empty string", () => {
-		const t = newStore().create("No goal");
-		expect(t.goal).toBe("");
+		expect(newStore().create("No goal").goal).toBe("");
+	});
+
+	it("suffixes the slug when the name is taken, including by the user's own folders", () => {
+		mkdirSync(join(root, "python"));
+		writeFileSync(join(root, "python", "my-notes.txt"), "mine");
+		const store = newStore();
+		const a = store.create("Python");
+		const b = store.create("Python");
+		expect(a.cwd).toBe(join(root, "python-2"));
+		expect(b.cwd).toBe(join(root, "python-3"));
+		// The user's folder is untouched and never becomes a topic.
+		expect(readdirSync(join(root, "python"))).toEqual(["my-notes.txt"]);
+		expect(store.list()).toHaveLength(2);
 	});
 
 	it("rejects empty/whitespace and oversized title before writing", () => {
@@ -84,12 +130,11 @@ describe("create", () => {
 		expect(() => store.create("")).toThrow();
 		expect(() => store.create("   ")).toThrow();
 		expect(() => store.create("x".repeat(TOPIC_TITLE_MAX + 1))).toThrow();
-		// Nothing was created on disk.
-		expect(existsSync(join(dataDir, "topics"))).toBe(false);
+		expect(readdirSync(root)).toEqual([]);
 		expect(store.list()).toEqual([]);
 	});
 
-	it("rejects an oversized goal but accepts the exactlimits", () => {
+	it("rejects an oversized goal but accepts the exact limits", () => {
 		const store = newStore();
 		expect(() => store.create("ok", "g".repeat(TOPIC_GOAL_MAX + 1))).toThrow();
 
@@ -107,7 +152,6 @@ describe("list/get", () => {
 
 		const list = store.list();
 		expect(list.map((t) => t.id)).toEqual([second.id, first.id]);
-		// Mutating a returned summary must not corrupt the store.
 		list[0].title = "mutated";
 		expect(store.get(second.id)?.title).toBe("Second");
 	});
@@ -119,29 +163,18 @@ describe("list/get", () => {
 	});
 });
 
-describe("two distinct topic directories", () => {
-	it("keeps separate workspace/sessions dirs per topic", () => {
+describe("findByCwd / sessionDirForCwd", () => {
+	it("maps each topic folder to its own sessions dir", () => {
 		const store = newStore();
 		const a = store.create("Alpha");
 		const b = store.create("Beta");
-
-		expect(a.id).not.toBe(b.id);
-		expect(a.cwd).not.toBe(b.cwd);
-		expect(store.list()).toHaveLength(2);
-		expect(existsSync(a.cwd)).toBe(true);
-		expect(existsSync(b.cwd)).toBe(true);
-		expect(store.sessionDirForCwd(a.cwd)).toBe(join(dataDir, "topics", a.id, "sessions"));
-		expect(store.sessionDirForCwd(b.cwd)).toBe(join(dataDir, "topics", b.id, "sessions"));
-	});
-});
-
-describe("findByCwd / sessionDirForCwd", () => {
-	it("finds by exact cwd and returns undefined otherwise", () => {
-		const store = newStore();
-		const t = store.create("Lookup");
-		expect(store.findByCwd(t.cwd)?.id).toBe(t.id);
-		expect(store.findByCwd(join(dataDir, "elsewhere"))).toBeUndefined();
-		expect(store.sessionDirForCwd(join(dataDir, "elsewhere"))).toBeUndefined();
+		expect(store.sessionDirForCwd(a.cwd)).toBe(join(root, "alpha", "sessions"));
+		expect(store.sessionDirForCwd(b.cwd)).toBe(join(root, "beta", "sessions"));
+		expect(store.findByCwd(a.cwd)?.id).toBe(a.id);
+		expect(store.findByCwd(join(root, "elsewhere"))).toBeUndefined();
+		expect(store.sessionDirForCwd(join(root, "elsewhere"))).toBeUndefined();
+		// A subfolder of a topic is not the topic.
+		expect(store.findByCwd(join(a.cwd, "notes"))).toBeUndefined();
 	});
 
 	it("case-folds cwd on Windows", () => {
@@ -159,13 +192,10 @@ describe("restart persistence", () => {
 		const a = first.create("Persisted A", "goal a");
 		const b = first.create("Persisted B");
 
-		const restarted = new TopicStore(dataDir);
-		const list = restarted.list();
-		expect(list.map((t) => t.id).sort()).toEqual([a.id, b.id].sort());
+		const restarted = newStore();
+		expect(restarted.list().map((t) => t.id).sort()).toEqual([a.id, b.id].sort());
 		expect(restarted.get(a.id)).toMatchObject({ title: "Persisted A", goal: "goal a", cwd: a.cwd });
-		expect(restarted.get(b.id)?.title).toBe("Persisted B");
-		expect(restarted.findByCwd(a.cwd)?.id).toBe(a.id);
-		expect(restarted.sessionDirForCwd(b.cwd)).toBe(join(dataDir, "topics", b.id, "sessions"));
+		expect(restarted.sessionDirForCwd(b.cwd)).toBe(join(b.cwd, "sessions"));
 	});
 
 	it("orders reloaded topics creation-descending", async () => {
@@ -173,105 +203,150 @@ describe("restart persistence", () => {
 		const older = first.create("Older");
 		await sleep(25);
 		const newer = first.create("Newer");
+		expect(newStore().list().map((t) => t.id)).toEqual([newer.id, older.id]);
+	});
 
-		const restarted = new TopicStore(dataDir);
-		expect(restarted.list().map((t) => t.id)).toEqual([newer.id, older.id]);
+	it("follows a moved root: the cwd comes from the folder, not the record", () => {
+		const t = newStore().create("Portable");
+		const moved = mkdtempSync(join(tmpdir(), "topics-moved-"));
+		try {
+			const record = readFileSync(join(t.cwd, "topic.json"), "utf8");
+			mkdirSync(join(moved, "portable"));
+			writeFileSync(join(moved, "portable", "topic.json"), record);
+			const store = new TopicStore(moved);
+			expect(store.get(t.id)?.cwd).toBe(join(moved, "portable"));
+		} finally {
+			rmSync(moved, { recursive: true, force: true });
+		}
+	});
+
+	it("setRoot rescans", () => {
+		const store = newStore();
+		store.create("Here");
+		const other = mkdtempSync(join(tmpdir(), "topics-other-"));
+		try {
+			store.setRoot(other);
+			expect(store.list()).toEqual([]);
+			store.setRoot(root);
+			expect(store.list()).toHaveLength(1);
+		} finally {
+			rmSync(other, { recursive: true, force: true });
+		}
 	});
 });
 
-describe("corrupt / foreign metadata recovery", () => {
+describe("corrupt / foreign folder recovery", () => {
 	it("ignores a corrupt topic.json but keeps valid topics", () => {
 		const first = newStore();
 		const good = first.create("Good");
 		const bad = first.create("Bad");
-		writeFileSync(topicFile(bad.id), "{ not json at all");
+		writeFileSync(join(bad.cwd, "topic.json"), "{ not json at all");
 
-		const restarted = new TopicStore(dataDir);
+		const restarted = newStore();
 		expect(restarted.list().map((t) => t.id)).toEqual([good.id]);
-		expect(restarted.get(bad.id)).toBeUndefined();
 	});
 
-	it("ignores non-UUID folder names and version/id/cwd mismatches", () => {
-		const first = newStore();
-		const valid = first.create("Valid");
+	it("ignores plain folders, non-slug names, slug/version/id mismatches and duplicate ids", () => {
+		const valid = newStore().create("Valid");
+		const record = (over: Record<string, unknown>) => ({
+			version: TOPIC_METADATA_VERSION,
+			id: "11111111-1111-4111-8111-111111111111",
+			slug: "x",
+			title: "T",
+			goal: "",
+			createdAt: Date.now(),
+			...over,
+		});
 
-		const topicsRoot = join(dataDir, "topics");
-		// A valid-looking record in a non-UUID folder must never be followed.
-		const foreign = join(topicsRoot, "not-a-uuid");
-		mkdirSync(foreign, { recursive: true });
-		writeFileSync(
-			join(foreign, "topic.json"),
-			JSON.stringify({
-				version: TOPIC_METADATA_VERSION,
-				id: "not-a-uuid",
-				title: "Evil",
-				goal: "",
-				createdAt: Date.now(),
-				cwd: join(foreign, "workspace"),
-			}),
-		);
+		mkdirSync(join(root, "ReactLearn")); // the user's own folder, no topic.json
+		writeTopic("Not A Slug", record({ slug: "Not A Slug" }));
+		writeTopic("mismatch", record({ slug: "other" }));
+		writeTopic("old-version", record({ version: 1, slug: "old-version" }));
+		writeTopic("bad-id", record({ id: "not-a-uuid", slug: "bad-id" }));
+		writeTopic("zz-copy", record({ id: valid.id, slug: "zz-copy" }));
 
-		// UUID folder with wrong version.
-		const wrongVersion = "11111111-1111-4111-8111-111111111111";
-		mkdirSync(join(topicsRoot, wrongVersion), { recursive: true });
-		writeFileSync(
-			join(topicsRoot, wrongVersion, "topic.json"),
-			JSON.stringify({ version: 2, id: wrongVersion, title: "Wrong", goal: "", createdAt: Date.now(), cwd: join(topicsRoot, wrongVersion, "workspace") }),
-		);
-
-		// UUID folder whose metadata id does not match the folder name.
-		const mismatched = "22222222-2222-4222-8222-222222222222";
-		mkdirSync(join(topicsRoot, mismatched), { recursive: true });
-		writeFileSync(
-			join(topicsRoot, mismatched, "topic.json"),
-			JSON.stringify({ version: 1, id: valid.id, title: "Mismatch", goal: "", createdAt: Date.now(), cwd: join(topicsRoot, mismatched, "workspace") }),
-		);
-
-		// UUID folder whose cwd points somewhere else.
-		const wrongCwd = "33333333-3333-4333-8333-333333333333";
-		mkdirSync(join(topicsRoot, wrongCwd), { recursive: true });
-		writeFileSync(
-			join(topicsRoot, wrongCwd, "topic.json"),
-			JSON.stringify({ version: 1, id: wrongCwd, title: "Wrong cwd", goal: "", createdAt: Date.now(), cwd: join(dataDir, "somewhere-else") }),
-		);
-
-		const restarted = new TopicStore(dataDir);
+		const restarted = newStore();
 		expect(restarted.list().map((t) => t.id)).toEqual([valid.id]);
+		expect(restarted.get(valid.id)?.cwd).toBe(valid.cwd);
 	});
 
 	it("does not follow a symlinked directory as a topic", () => {
-		const first = newStore();
-		first.create("Real");
-		const topicsRoot = join(dataDir, "topics");
-
-		const targetId = "44444444-4444-4444-8444-444444444444";
-		const outside = join(dataDir, "outside");
-		mkdirSync(join(outside, "workspace"), { recursive: true });
-		writeFileSync(
-			join(outside, "topic.json"),
-			JSON.stringify({
-				version: 1,
-				id: targetId,
-				title: "Symlinked",
-				goal: "",
-				createdAt: Date.now(),
-				cwd: join(outside, "workspace"),
-			}),
-		);
+		newStore().create("Real");
+		const outside = mkdtempSync(join(tmpdir(), "topics-outside-"));
 		try {
-			symlinkSync(join(outside), join(topicsRoot, targetId), "junction");
-		} catch {
-			return; // symlink creation unavailable (permissions) — skip.
+			writeFileSync(
+				join(outside, "topic.json"),
+				JSON.stringify({
+					version: TOPIC_METADATA_VERSION,
+					id: "44444444-4444-4444-8444-444444444444",
+					slug: "linked",
+					title: "Symlinked",
+					goal: "",
+					createdAt: Date.now(),
+				}),
+			);
+			try {
+				symlinkSync(outside, join(root, "linked"), "junction");
+			} catch {
+				return; // symlink creation unavailable (permissions) — skip.
+			}
+			const restarted = newStore();
+			expect(restarted.get("44444444-4444-4444-8444-444444444444")).toBeUndefined();
+			expect(restarted.list()).toHaveLength(1);
+		} finally {
+			rmSync(join(root, "linked"), { recursive: true, force: true });
+			rmSync(outside, { recursive: true, force: true });
 		}
-
-		const restarted = new TopicStore(dataDir);
-		expect(restarted.get(targetId)).toBeUndefined();
-		expect(restarted.list()).toHaveLength(1);
 	});
 
-	it("recovers from an entirely unreadable topics root", () => {
-		const store = new TopicStore(join(dataDir, "does-not-exist"));
+	it("recovers from an unreadable root", () => {
+		const store = new TopicStore(join(root, "does-not-exist"));
 		expect(store.list()).toEqual([]);
 		expect(store.findByCwd("whatever")).toBeUndefined();
+	});
+});
+
+describe("LearnRootConfig", () => {
+	it("starts unconfigured on the default root, then saves a chosen root", () => {
+		const cfg = new LearnRootConfig(root, undefined);
+		expect(cfg.info()).toEqual({
+			root: defaultLearnRoot(),
+			configured: false,
+			defaultRoot: defaultLearnRoot(),
+			fromEnv: false,
+		});
+
+		const chosen = join(root, "My Learning");
+		expect(cfg.set(chosen)).toBe(chosen);
+		expect(existsSync(chosen)).toBe(true);
+		expect(cfg.info()).toMatchObject({ root: chosen, configured: true });
+		// Survives a restart.
+		expect(new LearnRootConfig(root, undefined).info()).toMatchObject({ root: chosen, configured: true });
+	});
+
+	it("rejects relative paths and files", () => {
+		const cfg = new LearnRootConfig(root, undefined);
+		expect(() => cfg.set("relative/path")).toThrow();
+		expect(() => cfg.set("   ")).toThrow();
+		const file = join(root, "a-file");
+		writeFileSync(file, "x");
+		expect(() => cfg.set(file)).toThrow();
+		expect(cfg.info().configured).toBe(false);
+	});
+
+	it("LEARN_ROOT wins and cannot be changed from the UI", () => {
+		const pinned = join(root, "pinned");
+		const cfg = new LearnRootConfig(root, pinned);
+		expect(cfg.info()).toMatchObject({ root: pinned, configured: true, fromEnv: true });
+		expect(() => cfg.set(join(root, "other"))).toThrow(/LEARN_ROOT/);
+	});
+
+	it("drives a store: configureRoot saves and rescans", () => {
+		const store = TopicStore.fromConfig(new LearnRootConfig(root, undefined));
+		expect(store.rootInfo().configured).toBe(false);
+		const chosen = join(root, "chosen");
+		const info = store.configureRoot(chosen);
+		expect(info).toMatchObject({ root: chosen, configured: true });
+		expect(store.create("After").cwd).toBe(join(chosen, "after"));
 	});
 });

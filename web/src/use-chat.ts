@@ -20,6 +20,7 @@ import type {
 	SessionSummary,
 	SlashCommandInfo,
 	TopicSummary,
+	LearnRootInfo,
 	ToolStatus,
 	TerminalInfo,
 	UiModelConfigEntry,
@@ -98,6 +99,8 @@ export interface ChatState {
 	projects: ProjectSummary[];
 	/** Learning topics known to the server (sidebar groups). */
 	topics: TopicSummary[];
+	/** Where learning data lives; null until the server says (first-run dialog). */
+	learnRoot: LearnRootInfo | null;
 	/** Workspace file listing for the right panel. */
 	files: FileListing | null;
 	/** Latest file content fetched for the preview panel (path-matched in the modal). */
@@ -234,6 +237,7 @@ export type ChatAction =
 	  }
 	| { type: "projects"; projects: ProjectSummary[] }
 	| { type: "topics"; topics: TopicSummary[] }
+	| { type: "learn_root"; info: LearnRootInfo }
 	| { type: "files"; files: FileListing }
 	| { type: "file_changed"; path: string }
 	| { type: "file_content"; content: FileContent }
@@ -626,6 +630,8 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 			return { ...state, projects: action.projects };
 		case "topics":
 			return { ...state, topics: action.topics };
+		case "learn_root":
+			return { ...state, learnRoot: action.info };
 		case "files":
 			return { ...state, files: action.files };
 		case "file_changed":
@@ -805,6 +811,7 @@ export function initialChatState(): ChatState {
 		activeConversationId: "",
 		projects: [],
 		topics: [],
+		learnRoot: null,
 		files: null,
 
 		fileChanged: null,
@@ -1135,6 +1142,11 @@ export function useChat() {
 				case "topics":
 					dispatch({ type: "topics", topics: msg.topics });
 					break;
+				case "learn_root": {
+					const { type: _type, ...info } = msg;
+					dispatch({ type: "learn_root", info });
+					break;
+				}
 				case "files":
 					dispatch({ type: "files", files: msg });
 					break;

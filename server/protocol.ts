@@ -419,6 +419,8 @@ export type ClientMessage =
 	| { type: "list_topics" }
 	| { type: "create_topic"; title: string; goal?: string }
 	| { type: "select_topic"; id: string }
+	/** Choose the learning root (first run); answered with `learn_root` + `topics`. */
+	| { type: "set_learn_root"; root: string }
 	/** Open the host OS folder picker; cancellation leaves the project unchanged. */
 	| { type: "pick_project_folder" }
 	| { type: "list_files"; path?: string }
@@ -619,7 +621,16 @@ export interface ProjectSummary {
 	lastUsed: number;
 }
 
-/** Persisted learning topic. Its cwd is a private workspace under the data root. */
+/** Where learning data lives. `configured` is false until the user confirms a
+ *  root on first run; `fromEnv` means LEARN_ROOT pins it for this process. */
+export interface LearnRootInfo {
+	root: string;
+	configured: boolean;
+	defaultRoot: string;
+	fromEnv: boolean;
+}
+
+/** Persisted learning topic. Its cwd is the topic's own folder, `<learnRoot>/<slug>`. */
 export interface TopicSummary {
 	id: string;
 	title: string;
@@ -1002,6 +1013,7 @@ export type ServerMessage =
 	  }
 	| { type: "projects"; projects: ProjectSummary[] }
 	| { type: "topics"; topics: TopicSummary[] }
+	| ({ type: "learn_root" } & LearnRootInfo)
 	| {
 			type: "files";
 			path: string;

@@ -30,6 +30,7 @@ const TerminalPanel = lazy(() => import("./components/TerminalPanel").then((m) =
 import { registerAttachmentSink } from "./composer-bridge";
 import { appendDraftAttachments } from "./composer-draft";
 import { PiSetupModal } from "./components/PiSetupModal";
+import { LearnRootModal } from "./components/LearnRootModal";
 import { ModelConfigModal } from "./components/ModelConfigModal";
 
 import { SettingsModal } from "./components/SettingsModal";
@@ -1013,6 +1014,7 @@ export function App() {
 					onClose={() => setPreviewFile(null)}
 				/>
 			)}
+			{chat.ready && chat.learnRoot && !chat.learnRoot.configured && <LearnRootModal info={chat.learnRoot} />}
 			{chat.ready && chat.state && chat.state.piConfigured === false && !setupDismissed && !manageModelsOpen && (
 				<PiSetupModal
 					piConfigured={chat.state.piConfigured}
