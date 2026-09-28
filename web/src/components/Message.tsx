@@ -27,6 +27,8 @@ import { Markdown } from "./Markdown";
 import { StreamMarkdown } from "./StreamMarkdown";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { ToolCallBlock, type ToolView } from "./ToolCallBlock";
+import { NoteCard } from "./NoteCard";
+import { NOTE_WRITE_TOOL, noteCardData } from "../note-card";
 import { useT, type Translate } from "../i18n";
 import { parseSkillBlock, type SkillBlock } from "../skill-block";
 import { isRasterImage, fileToProcessedImage } from "../image-paste";
@@ -910,6 +912,17 @@ function Block({
 			streaming,
 			status: toolStatuses.get(toolCall.id),
 		};
+		// A concept note renders as the note itself (the tutor doesn't repeat it
+		// in chat). A failed write stays a normal tool card so the error shows.
+		if (toolCall.name === NOTE_WRITE_TOOL && !result?.isError) {
+			return (
+				<NoteCard
+					note={noteCardData(toolCall.argumentsText, result?.details)}
+					pending={!result}
+					forceOpen={searchActive}
+				/>
+			);
+		}
 		return (
 			<ToolCallBlock block={toolCall} view={view} onKillBash={onKillBash} wrap={toolsWrap} forceOpen={searchActive} />
 		);
