@@ -15,6 +15,10 @@
  * optional `isActive` gate additionally drops events from
  * inactive/background conversations so they never appear on the active chat.
  * No topic persistence: demo events are fire-and-forget per run.
+ *
+ * The per-run demo emit is opt-in (`demo: true`, wired to
+ * LEARN_DEMO_EVENTS=1): it proves the round trip, but in a real tutoring
+ * session a "bridge online" card on every turn is noise.
  */
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import type { LearnEvent } from "./protocol.js";
@@ -42,6 +46,7 @@ export function isLearnEvent(data: unknown): data is LearnEvent {
 export function makeLearnBridgeExtension(
 	forward: (event: LearnEvent) => void,
 	isActive?: () => boolean,
+	options: { demo?: boolean } = {},
 ): ExtensionFactory {
 	return (pi: ExtensionAPI) => {
 		pi.events.on(LEARN_DEMO_CHANNEL, (data: unknown) => {
@@ -50,6 +55,7 @@ export function makeLearnBridgeExtension(
 			if (isActive && !isActive()) return;
 			forward(data);
 		});
+		if (!options.demo) return;
 		pi.on("agent_start", () => {
 			pi.events.emit(LEARN_DEMO_CHANNEL, {
 				version: 1,

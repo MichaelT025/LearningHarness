@@ -59,9 +59,22 @@ describe("isLearnEvent", () => {
 });
 
 describe("makeLearnBridgeExtension", () => {
-	it("subscribes once at factory time, emits a demo per agent_start, forwards validated events", () => {
+	it("emits no demo by default but still forwards events from the engine", () => {
 		const forwarded: unknown[] = [];
 		const factory = makeLearnBridgeExtension((e) => forwarded.push(e));
+		const fake = makeFakePi();
+
+		factory(fake.pi);
+		fake.fireAgentStart();
+		expect(fake.emit).not.toHaveBeenCalled();
+		expect(forwarded).toEqual([]);
+		fake.publish(LEARN_DEMO_CHANNEL, { version: 1, type: "demo", message: "from the engine" });
+		expect(forwarded).toEqual([{ version: 1, type: "demo", message: "from the engine" }]);
+	});
+
+	it("subscribes once at factory time, emits a demo per agent_start, forwards validated events", () => {
+		const forwarded: unknown[] = [];
+		const factory = makeLearnBridgeExtension((e) => forwarded.push(e), undefined, { demo: true });
 		const fake = makeFakePi();
 
 		factory(fake.pi);
@@ -83,7 +96,7 @@ describe("makeLearnBridgeExtension", () => {
 
 	it("second agent_start yields exactly 2 forwards, not 3 (no per-run subscriber leak)", () => {
 		const forwarded: unknown[] = [];
-		const factory = makeLearnBridgeExtension((e) => forwarded.push(e));
+		const factory = makeLearnBridgeExtension((e) => forwarded.push(e), undefined, { demo: true });
 		const fake = makeFakePi();
 
 		factory(fake.pi);
@@ -100,6 +113,7 @@ describe("makeLearnBridgeExtension", () => {
 		const factory = makeLearnBridgeExtension(
 			(e) => forwarded.push(e),
 			() => active,
+			{ demo: true },
 		);
 		const fake = makeFakePi();
 

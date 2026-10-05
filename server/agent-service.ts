@@ -1242,6 +1242,7 @@ export class ClientSession {
 									}
 								},
 								() => ownerId === undefined || this.activeId === ownerId,
+								{ demo: process.env.LEARN_DEMO_EVENTS === "1" },
 							),
 						},
 						{
