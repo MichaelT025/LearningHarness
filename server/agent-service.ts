@@ -3744,9 +3744,11 @@ export class ClientSession {
 		this.emit({ type: "learn_root", ...this.topicStore.rootInfo() });
 	}
 
-	/** First-run choice of the learning root. Rescans topics there. */
+	/** Choose (first run) or change the learning root. Rescans topics there. */
 	async setLearnRoot(root: string): Promise<void> {
 		return this.enqueueTopicNav(async () => {
+			// The topic the active chat belongs to, if any, before the switch.
+			const activeTopic = this.topicStore.findByCwd(this.cwd);
 			try {
 				this.topicStore.configureRoot(root);
 			} catch (err) {
@@ -3758,6 +3760,17 @@ export class ClientSession {
 			}
 			this.pushLearnRoot();
 			await this.pushTopics();
+			// The active chat's topic lived in the old root: the store no longer
+			// knows it, so its next run would get pi's stock coding prompt while
+			// its runtime still carries note_write and the topic guard.
+			if (activeTopic && !this.topicStore.findByCwd(this.cwd)) {
+				await this.setCwd(process.env.PI_WEB_CWD ?? process.cwd());
+				this.emit({
+					type: "notice",
+					level: "warning",
+					text: `"${activeTopic.title}" is in the previous learning folder, so a new chat was opened. Its history is still on disk.`,
+				});;
+			}
 		});
 	}
 

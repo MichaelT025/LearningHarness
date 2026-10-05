@@ -512,3 +512,41 @@
 		color: var(--text);
 	}
 }
+
+/* New Topic + learning-folder button share one row. */
+.lp-topic-row {
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	margin: 0 8px;
+}
+.lp-topic-row .lp-new-topic {
+	flex: 1;
+	width: auto;
+	margin: 0;
+}
+.lp-root-btn {
+	display: flex;
+	flex: none;
+	align-items: center;
+	justify-content: center;
+	width: 32px;
+	height: 32px;
+	border: 0;
+	border-radius: var(--radius-sm, 6px);
+	background: transparent;
+	color: var(--text-dim);
+	cursor: pointer;
+}
+.lp-root-btn:hover {
+	background: var(--bg-elev2);
+	color: var(--text);
+}
+.lp-root-btn:focus-visible {
+	outline: 0;
+	box-shadow: var(--ring);
+}
+.lp-root-btn svg {
+	width: 16px;
+	height: 16px;
+}

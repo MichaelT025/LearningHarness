@@ -296,6 +296,11 @@ export function App() {
 	// facing below reads it, not chat.state.
 	const cwd = viewState?.cwd ?? "";
 	const projectTitle = useProjectTitle();
+	// Learning-folder dialog opened from the sidebar (first run shows it
+	// unconditionally). Stable callbacks: LeftPanel is memoized.
+	const [rootDialogOpen, setRootDialogOpen] = useState(false);
+	const openRootDialog = useCallback(() => setRootDialogOpen(true), []);
+	const closeRootDialog = useCallback(() => setRootDialogOpen(false), []);
 	// A topic chat shows the topic's title, not its folder slug.
 	const cwdTopicTitle = useMemo(
 		() => (cwd ? chat.topics.find((tp) => cwdKey(tp.cwd) === cwdKey(cwd))?.title : undefined),
@@ -851,6 +856,8 @@ export function App() {
 						sessionsByCwd={chat.sessionsByCwd}
 						projects={chat.projects}
 						topics={chat.topics}
+						learnRootPath={chat.learnRoot?.root}
+						onChangeLearnRoot={openRootDialog}
 						activeConversationId={chat.activeConversationId}
 					/>
 				</div>
@@ -1039,6 +1046,9 @@ export function App() {
 				/>
 			)}
 			{chat.ready && chat.learnRoot && !chat.learnRoot.configured && <LearnRootModal info={chat.learnRoot} />}
+			{chat.ready && chat.learnRoot?.configured && rootDialogOpen && (
+				<LearnRootModal info={chat.learnRoot} onClose={closeRootDialog} />
+			)}
 			{chat.ready && chat.state && chat.state.piConfigured === false && !setupDismissed && !manageModelsOpen && (
 				<PiSetupModal
 					piConfigured={chat.state.piConfigured}

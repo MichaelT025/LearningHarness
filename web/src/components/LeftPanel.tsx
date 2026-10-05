@@ -37,6 +37,10 @@ interface LeftPanelProps {
 	projects: ProjectSummary[];
 	/** Learning topics (sidebar groups backed by topic workspaces). */
 	topics: TopicSummary[];
+	/** Current learning folder (tooltip of the change-folder button). */
+	learnRootPath?: string;
+	/** Opens the learning-folder dialog. Must be stable (panel is memoized). */
+	onChangeLearnRoot?: () => void;
 	activeConversationId: string;
 	panelSend: (
 		msg:
@@ -100,6 +104,8 @@ export const LeftPanel = memo(function LeftPanel({
 	sessionsByCwd,
 	projects,
 	topics,
+	learnRootPath,
+	onChangeLearnRoot,
 	activeConversationId,
 	panelSend,
 	active,
@@ -465,19 +471,33 @@ export const LeftPanel = memo(function LeftPanel({
 				<span>{t("newChat")}</span>
 			</button>
 			{!topicFormOpen ? (
-				<button
-					type="button"
-					className="lp-new-topic"
-					title="New learning topic"
-					disabled={!ready}
-					onClick={() => {
-						setTopicError(null);
-						setTopicFormOpen(true);
-					}}
-				>
-					<FiPlus />
-					<span>New Topic</span>
-				</button>
+				<div className="lp-topic-row">
+					<button
+						type="button"
+						className="lp-new-topic"
+						title="New learning topic"
+						disabled={!ready}
+						onClick={() => {
+							setTopicError(null);
+							setTopicFormOpen(true);
+						}}
+					>
+						<FiPlus />
+						<span>New Topic</span>
+					</button>
+					{onChangeLearnRoot && (
+						<button
+							type="button"
+							className="lp-root-btn"
+							title={learnRootPath ? `Learning folder: ${learnRootPath}` : "Learning folder"}
+							aria-label="Change learning folder"
+							disabled={!ready}
+							onClick={onChangeLearnRoot}
+						>
+							<FiFolder />
+						</button>
+					)}
+				</div>
 			) : (
 				<div className="lp-topic-form">
 					<input
