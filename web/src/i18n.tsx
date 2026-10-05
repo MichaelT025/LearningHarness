@@ -127,7 +127,7 @@ export const en = {
 	placeholderStreaming: "The agent is working… press Enter to steer, or click Queue to send after the reply finishes",
 	placeholderStreamingQueued:
 		"The agent is working… press Enter or click Queue — delivered after the reply finishes (this engine cannot steer)",
-	placeholderIdle: "Do anything",
+	placeholderIdle: "Ask anything, or say what you want to learn",
 	placeholderConnecting: "Connecting to server…",
 	stopAgent: "Stop agent",
 	stop: "Stop",

@@ -296,10 +296,15 @@ export function App() {
 	// facing below reads it, not chat.state.
 	const cwd = viewState?.cwd ?? "";
 	const projectTitle = useProjectTitle();
+	// A topic chat shows the topic's title, not its folder slug.
+	const cwdTopicTitle = useMemo(
+		() => (cwd ? chat.topics.find((tp) => cwdKey(tp.cwd) === cwdKey(cwd))?.title : undefined),
+		[chat.topics, cwd],
+	);
 	useEffect(() => {
-		const name = projectTitle ? projectNameFromCwd(cwd) : "";
+		const name = projectTitle ? (cwdTopicTitle ?? projectNameFromCwd(cwd)) : "";
 		document.title = name ? `${name} — LearningHarness` : t("docTitle");
-	}, [cwd, projectTitle, t]);
+	}, [cwd, cwdTopicTitle, projectTitle, t]);
 	const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
 	// 宿主注入的待发附件（浏览器元素拾取扩展的截图 → window.__piWebUiHost.compose）：
 	// 只追加不覆盖，判重口径与下面的 attach() 一致（见 composer-draft.ts）。
